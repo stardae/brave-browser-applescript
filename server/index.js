@@ -1,0 +1,6404 @@
+#!/usr/bin/env node
+
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+
+const execFileAsync = promisify(execFile);
+
+console.error("Brave Browser AppleScript MCP server starting...");
+
+// Constants
+const APPLESCRIPT_TIMEOUT = 10000; // 10 seconds
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000; // 1 second
+
+// Universal type caster for AppleScript values
+function universalCast(value) {
+  if (value === null || value === undefined) return null;
+  
+  const str = String(value).trim();
+  if (str === '') return '';
+  
+  // Boolean
+  const lower = str.toLowerCase();
+  if (['true', 'yes'].includes(lower)) return true;
+  if (['false', 'no'].includes(lower)) return false;
+  
+  // Number
+  if (/^-?\d+(\.\d+)?$/.test(str)) {
+    const num = Number(str);
+    return Number.isInteger(num) ? num : num;
+  }
+  
+  // List/Record - anything in braces, return as-is for AppleScript
+  if (str.startsWith('{') && str.endsWith('}')) {
+    return str; // AppleScript will handle the parsing
+  }
+  
+  // Auto-detect comma-separated values that should be lists/rectangles
+  if (str.includes(',') && !str.startsWith('{')) {
+    const parts = str.split(',').map(p => p.trim());
+    
+    // Rectangle pattern: 4 numbers (x, y, width, height)
+    if (parts.length === 4 && parts.every(p => /^-?\d+(\.\d+)?$/.test(p))) {
+      return `{${str}}`; // Add brackets for rectangle
+    }
+    
+    // Generic list: 2+ comma-separated values
+    if (parts.length >= 2) {
+      return `{${str}}`; // Add brackets for list
+    }
+  }
+  
+  // Date patterns
+  if (str.startsWith('date "') || /^\d{4}-\d{2}-\d{2}/.test(str)) {
+    return `date "${str}"`;
+  }
+  
+  // String - remove quotes if present
+  if ((str.startsWith('"') && str.endsWith('"')) || 
+      (str.startsWith("'") && str.endsWith("'"))) {
+    return str.slice(1, -1);
+  }
+  
+  return str;
+}
+
+// Cast and escape for AppleScript injection
+function castAndEscape(value) {
+  const casted = universalCast(value);
+  
+  // If it's a string that doesn't start with {, escape it
+  if (typeof casted === 'string' && !casted.startsWith('{') && !casted.startsWith('date')) {
+    return escapeForAppleScript(casted);
+  }
+  
+  // Numbers, booleans, and AppleScript literals go as-is
+  return casted;
+}
+
+// Helper function to escape strings for AppleScript
+function escapeForAppleScript(str) {
+  if (typeof str !== "string") return str;
+  return str
+    .replace(/\\/g, "\\\\") // Escape backslashes first
+    .replace(/"/g, '\"') // Then escape double quotes
+    .replace(/\n/g, "\\n") // Escape newlines
+    .replace(/\r/g, "\\r"); // Escape carriage returns
+}
+
+// Test if Brave Browser is available
+async function checkBraveBrowserAvailable() {
+  try {
+    const script = 'tell application "Brave Browser" to return "available"';
+    const result = await executeAppleScript(script);
+    return result === "available";
+  } catch (error) {
+    return false;
+  }
+}
+
+// Execute AppleScript with retry logic
+async function executeAppleScript(script, retries = MAX_RETRIES) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const { stdout, stderr } = await execFileAsync(
+        "osascript",
+        ["-e", script],
+        {
+          timeout: APPLESCRIPT_TIMEOUT,
+          maxBuffer: 1024 * 1024, // 1MB buffer
+        },
+      );
+      if (stderr) {
+        console.error("AppleScript stderr:", stderr);
+      }
+      return stdout.trim();
+    } catch (error) {
+      if (attempt === retries) {
+        console.error("AppleScript execution error after retries:", error);
+        throw new Error(`AppleScript error: ${error.message}`);
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, RETRY_DELAY * Math.pow(2, attempt)),
+      );
+    }
+  }
+}
+
+// MCP server implementation
+class BraveBrowserMCPServer {
+  constructor() {
+    this.initialized = false;
+    this.setupStdio();
+  }
+
+  setupStdio() {
+    process.stdin.setEncoding('utf8');
+    
+    let buffer = '';
+    process.stdin.on('data', (data) => {
+      buffer += data;
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+      
+      lines.forEach(line => {
+        if (line.trim()) {
+          this.handleMessage(line.trim());
+        }
+      });
+    });
+  }
+
+  async handleMessage(data) {
+    try {
+      const request = JSON.parse(data);
+      console.error("Received request:", request.method, request.id);
+      
+      if (request.method === 'initialize') {
+        await this.handleInitialize(request);
+      } else if (request.method === 'initialized') {
+        await this.handleInitialized(request);
+      } else if (request.method === 'tools/list') {
+        await this.handleToolsList(request);
+      } else if (request.method === 'tools/call') {
+        await this.handleToolsCall(request);
+      } else {
+        console.error("Unknown method:", request.method);
+      }
+    } catch (error) {
+      console.error("Error processing message:", error);
+    }
+  }
+
+  async handleInitialize(request) {
+    console.error("Handling initialize request");
+    const response = {
+      jsonrpc: '2.0',
+      id: request.id,
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: {
+          tools: {}
+        },
+        serverInfo: {
+          name: 'bravebrowser-applescript',
+          version: '0.1.0'
+        }
+      }
+    };
+    this.sendResponse(response);
+  }
+
+  async handleInitialized(request) {
+    console.error("Handling initialized notification");
+    this.initialized = true;
+  }
+
+  async handleToolsList(request) {
+    console.error("Handling tools/list request");
+    const response = {
+      jsonrpc: '2.0',
+      id: request.id,
+      result: {
+        tools: [
+          {
+  name: 'open',
+  description: 'Open a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_file: {
+        type: 'string',
+        description: 'The file(s) to be opened.'
+      }
+    },
+    required: ['direct_parameter_required_file'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'close_for_document',
+  description: 'Close a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      },
+      saving_optional_save_options: {
+        type: 'string',
+        description: 'Should changes be saved before closing?'
+      },
+      saving_in_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the document, if so.'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'close_for_tab_of_window',
+  description: 'Close a tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      saving_optional_save_options: {
+        type: 'string',
+        description: 'Should changes be saved before closing?'
+      },
+      saving_in_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the document, if so.'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'close_for_window',
+  description: 'Close a window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      saving_optional_save_options: {
+        type: 'string',
+        description: 'Should changes be saved before closing?'
+      },
+      saving_in_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the document, if so.'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'save_for_document',
+  description: 'Save a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      },
+      inParam_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the document.'
+      },
+      as_optional_saveable_file_format: {
+        type: 'string',
+        description: 'The file format to use.'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'save_for_tab_of_window',
+  description: 'Save a tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      inParam_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the document.'
+      },
+      as_optional_saveable_file_format: {
+        type: 'string',
+        description: 'The file format to use.'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'save_for_window',
+  description: 'Save a window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      inParam_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the document.'
+      },
+      as_optional_saveable_file_format: {
+        type: 'string',
+        description: 'The file format to use.'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'print_file',
+  description: 'Print a document. (file input)',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_list_of_file: {
+        type: 'string',
+        description: 'The file(s), document(s), or window(s) to be printed.'
+      },
+      with_properties_optional_print_settings: {
+        type: 'string',
+        description: 'The print settings to use.'
+      },
+      print_dialog_optional_boolean: {
+        type: 'boolean',
+        description: 'Should the application show the print dialog?'
+      }
+    },
+    required: ['direct_parameter_required_list_of_file'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'print_for_document',
+  description: 'Print a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      },
+      with_properties_optional_print_settings: {
+        type: 'string',
+        description: 'The print settings to use.'
+      },
+      print_dialog_optional_boolean: {
+        type: 'boolean',
+        description: 'Should the application show the print dialog?'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'print_for_tab_of_window',
+  description: 'Print a tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      with_properties_optional_print_settings: {
+        type: 'string',
+        description: 'The print settings to use.'
+      },
+      print_dialog_optional_boolean: {
+        type: 'boolean',
+        description: 'Should the application show the print dialog?'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'print_for_window',
+  description: 'Print a window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      with_properties_optional_print_settings: {
+        type: 'string',
+        description: 'The print settings to use.'
+      },
+      print_dialog_optional_boolean: {
+        type: 'boolean',
+        description: 'Should the application show the print dialog?'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'quit',
+  description: 'Quit the application.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      saving_optional_save_options: {
+        type: 'string',
+        description: 'Should changes be saved before quitting?'
+      }
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_document',
+  description: 'Return the number of elements of a particular class within a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_bookmark_item_of_bookmark_folder',
+  description: 'Return the number of elements of a particular class within a bookmark item of bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_tab_of_window',
+  description: 'Return the number of elements of a particular class within a tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_window',
+  description: 'Return the number of elements of a particular class within a window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_bookmark_folder',
+  description: 'Return the number of elements of a particular class within a bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'delete',
+  description: 'Delete an object.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_specifier: {
+        type: 'string',
+        description: 'The object(s) to delete.'
+      }
+    },
+    required: ['direct_parameter_required_specifier'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'duplicate',
+  description: 'Copy an object.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_specifier: {
+        type: 'string',
+        description: 'The object(s) to copy.'
+      },
+      to_optional_location_specifier: {
+        type: 'string',
+        description: 'The location for the new copy or copies.'
+      },
+      with_properties_optional_record: {
+        type: 'string',
+        description: 'Properties to set in the new copy or copies right away.'
+      }
+    },
+    required: ['direct_parameter_required_specifier'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'exists',
+  description: 'Verify that an object exists.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_any: {
+        type: 'string',
+        description: 'The object(s) to check.'
+      }
+    },
+    required: ['direct_parameter_required_any'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_document',
+  description: 'Create a new document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_optional_location_specifier: {
+        type: 'string',
+        description: 'The location at which to insert the object.'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      }
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_bookmark_item_of_bookmark_folder',
+  description: 'Create a new bookmark item of bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_required_location_specifier_bookmark_folder: {
+        type: 'string',
+        description: 'The bookmark folder location where the bookmark item should be created (e.g., \"bookmark folder 1\")'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      },
+      with_properties_optional_text_title: {
+        type: 'string',
+        description: 'Optional title property: The title of the bookmark item.'
+      },
+      with_properties_optional_text_url: {
+        type: 'string',
+        description: 'Optional URL property: The URL of the bookmark.'
+      }
+    },
+    required: ['at_required_location_specifier_bookmark_folder'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_tab_of_window',
+  description: 'Create a new tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_required_location_specifier_window: {
+        type: 'string',
+        description: 'The window location where the tab should be created (e.g., \"window 1\")'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      },
+      with_properties_optional_text_url: {
+        type: 'string',
+        description: 'Optional URL property: The url visible to the user.'
+      }
+    },
+    required: ['at_required_location_specifier_window'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_window',
+  description: 'Create a new window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_optional_location_specifier: {
+        type: 'string',
+        description: 'The location at which to insert the object.'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      },
+      with_properties_optional_integer_index: {
+        type: 'number',
+        description: 'Optional index property: The index of the window, ordered front to back.'
+      },
+      with_properties_optional_text_given_name: {
+        type: 'string',
+        description: 'Optional given name property: The given name of the window.'
+      },
+      with_properties_optional_boolean_zoomed: {
+        type: 'boolean',
+        description: 'Optional zoomed property: Whether the window is currently zoomed.'
+      },
+      with_properties_optional_integer_active_tab_index: {
+        type: 'number',
+        description: 'Optional active tab index property: The index of the active tab.'
+      },
+      with_properties_optional_boolean_miniaturized: {
+        type: 'boolean',
+        description: 'Optional miniaturized property: Is the window minimized right now?'
+      },
+      with_properties_optional_boolean_minimized: {
+        type: 'boolean',
+        description: 'Optional minimized property: Whether the window is currently minimized.'
+      },
+      with_properties_optional_boolean_visible: {
+        type: 'boolean',
+        description: 'Optional visible property: Whether the window is currently visible.'
+      },
+      with_properties_optional_text_mode: {
+        type: 'string',
+        description: 'Optional mode property: Represents the mode of the window which can be \'normal\' or \'incognito\', can be set only once during creation of the window.'
+      },
+      with_properties_optional_rectangle_bounds: {
+        type: 'string',
+        description: 'Optional bounds property: The bounding rectangle of the window.'
+      }
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_bookmark_folder',
+  description: 'Create a new bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_optional_location_specifier: {
+        type: 'string',
+        description: 'The location at which to insert the object.'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      },
+      with_properties_optional_text_title: {
+        type: 'string',
+        description: 'Optional title property: The title of the folder.'
+      }
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'move',
+  description: 'Move an object to a new location.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_specifier: {
+        type: 'string',
+        description: 'The object(s) to move.'
+      },
+      to_required_location_specifier: {
+        type: 'string',
+        description: 'The new location for the object(s).'
+      }
+    },
+    required: ['direct_parameter_required_specifier', 'to_required_location_specifier'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_name_of_application',
+  description: 'Get The name of the application.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_frontmost_of_application',
+  description: 'Get Is this the active application?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_version_of_application',
+  description: 'Get The version number of the application.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_name_of_document',
+  description: 'Get Its name. of document',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_modified_of_document',
+  description: 'Get Has it been modified since the last save? of document',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_file_of_document',
+  description: 'Get Its location on disk, if it has one. of document',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_name_of_window',
+  description: 'Get The title of the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_id_of_window',
+  description: 'Get The unique identifier of the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_index_of_window',
+  description: 'Get The index of the window, ordered front to back.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_index_of_window',
+  description: 'Set The index of the window, ordered front to back.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_integer: {
+        type: 'number',
+        description: 'New value for The index of the window, ordered front to back.'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_integer'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_bounds_of_window',
+  description: 'Get The bounding rectangle of the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_bounds_of_window',
+  description: 'Set The bounding rectangle of the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_rectangle: {
+        type: 'string',
+        description: 'New value for The bounding rectangle of the window.'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_rectangle'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_closeable_of_window',
+  description: 'Get Does the window have a close button?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_miniaturizable_of_window',
+  description: 'Get Does the window have a minimize button?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_miniaturized_of_window',
+  description: 'Get Is the window minimized right now?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_miniaturized_of_window',
+  description: 'Set Is the window minimized right now?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_boolean: {
+        type: 'boolean',
+        description: 'New value for Is the window minimized right now?'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_boolean'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_resizable_of_window',
+  description: 'Get Can the window be resized?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_visible_of_window',
+  description: 'Get Is the window visible right now?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_visible_of_window',
+  description: 'Set Is the window visible right now?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_boolean: {
+        type: 'boolean',
+        description: 'New value for Is the window visible right now?'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_boolean'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_zoomable_of_window',
+  description: 'Get Does the window have a zoom button?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_zoomed_of_window',
+  description: 'Get Is the window zoomed right now?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_zoomed_of_window',
+  description: 'Set Is the window zoomed right now?',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_boolean: {
+        type: 'boolean',
+        description: 'New value for Is the window zoomed right now?'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_boolean'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_document_of_window',
+  description: 'Get The document whose contents are displayed in the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'save_for_document',
+  description: 'Save a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      },
+      inParam_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the object.'
+      },
+      as_optional_text: {
+        type: 'string',
+        description: 'The file type in which to save the data. Can be \'only html\', \'complete html\', or \'single file\'; default is \'complete html\'.'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'save_for_tab_of_window',
+  description: 'Save a tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      inParam_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the object.'
+      },
+      as_optional_text: {
+        type: 'string',
+        description: 'The file type in which to save the data. Can be \'only html\', \'complete html\', or \'single file\'; default is \'complete html\'.'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'save_for_window',
+  description: 'Save a window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      inParam_optional_file: {
+        type: 'string',
+        description: 'The file in which to save the object.'
+      },
+      as_optional_text: {
+        type: 'string',
+        description: 'The file type in which to save the data. Can be \'only html\', \'complete html\', or \'single file\'; default is \'complete html\'.'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'open',
+  description: 'Open a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_list_of_file: {
+        type: 'string',
+        description: 'The file(s) to be opened.'
+      }
+    },
+    required: ['direct_parameter_required_list_of_file'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'close_for_document',
+  description: 'Close a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'close_for_tab_of_window',
+  description: 'Close a tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'close_for_window',
+  description: 'Close a window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'quit',
+  description: 'Quit the application.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_document',
+  description: 'Return the number of elements of a particular class within a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_bookmark_item_of_bookmark_folder',
+  description: 'Return the number of elements of a particular class within a bookmark item of bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_tab_of_window',
+  description: 'Return the number of elements of a particular class within a tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_window',
+  description: 'Return the number of elements of a particular class within a window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'count_bookmark_folder',
+  description: 'Return the number of elements of a particular class within a bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'delete',
+  description: 'Delete an object.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_specifier: {
+        type: 'string',
+        description: 'the object to delete'
+      }
+    },
+    required: ['direct_parameter_required_specifier'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'duplicate',
+  description: 'Copy object(s) and put the copies at a new location.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_specifier: {
+        type: 'string',
+        description: 'the object(s) to duplicate'
+      },
+      to_optional_location_specifier: {
+        type: 'string',
+        description: 'The location for the new object(s).'
+      },
+      with_properties_optional_record: {
+        type: 'string',
+        description: 'Properties to be set in the new duplicated object(s).'
+      }
+    },
+    required: ['direct_parameter_required_specifier'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'exists',
+  description: 'Verify if an object exists.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_any: {
+        type: 'string',
+        description: 'the object in question'
+      }
+    },
+    required: ['direct_parameter_required_any'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_document',
+  description: 'Make a new document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_optional_location_specifier: {
+        type: 'string',
+        description: 'The location at which to insert the object.'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      }
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_bookmark_item_of_bookmark_folder',
+  description: 'Make a new bookmark item of bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_required_location_specifier_bookmark_folder: {
+        type: 'string',
+        description: 'The bookmark folder location where the bookmark item should be created (e.g., \"bookmark folder 1\")'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      },
+      with_properties_optional_text_title: {
+        type: 'string',
+        description: 'Optional title property: The title of the bookmark item.'
+      },
+      with_properties_optional_text_url: {
+        type: 'string',
+        description: 'Optional URL property: The URL of the bookmark.'
+      }
+    },
+    required: ['at_required_location_specifier_bookmark_folder'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_tab_of_window',
+  description: 'Make a new tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_required_location_specifier_window: {
+        type: 'string',
+        description: 'The window location where the tab should be created (e.g., \"window 1\")'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      },
+      with_properties_optional_text_url: {
+        type: 'string',
+        description: 'Optional URL property: The url visible to the user.'
+      }
+    },
+    required: ['at_required_location_specifier_window'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_window',
+  description: 'Make a new window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_optional_location_specifier: {
+        type: 'string',
+        description: 'The location at which to insert the object.'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      },
+      with_properties_optional_integer_index: {
+        type: 'number',
+        description: 'Optional index property: The index of the window, ordered front to back.'
+      },
+      with_properties_optional_text_given_name: {
+        type: 'string',
+        description: 'Optional given name property: The given name of the window.'
+      },
+      with_properties_optional_boolean_zoomed: {
+        type: 'boolean',
+        description: 'Optional zoomed property: Whether the window is currently zoomed.'
+      },
+      with_properties_optional_integer_active_tab_index: {
+        type: 'number',
+        description: 'Optional active tab index property: The index of the active tab.'
+      },
+      with_properties_optional_boolean_miniaturized: {
+        type: 'boolean',
+        description: 'Optional miniaturized property: Is the window minimized right now?'
+      },
+      with_properties_optional_boolean_minimized: {
+        type: 'boolean',
+        description: 'Optional minimized property: Whether the window is currently minimized.'
+      },
+      with_properties_optional_boolean_visible: {
+        type: 'boolean',
+        description: 'Optional visible property: Whether the window is currently visible.'
+      },
+      with_properties_optional_text_mode: {
+        type: 'string',
+        description: 'Optional mode property: Represents the mode of the window which can be \'normal\' or \'incognito\', can be set only once during creation of the window.'
+      },
+      with_properties_optional_rectangle_bounds: {
+        type: 'string',
+        description: 'Optional bounds property: The bounding rectangle of the window.'
+      }
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'make_bookmark_folder',
+  description: 'Make a new bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      at_optional_location_specifier: {
+        type: 'string',
+        description: 'The location at which to insert the object.'
+      },
+      with_data_optional_any: {
+        type: 'string',
+        description: 'The initial contents of the object.'
+      },
+      with_properties_optional_text_title: {
+        type: 'string',
+        description: 'Optional title property: The title of the folder.'
+      }
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'move',
+  description: 'Move object(s) to a new location.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      direct_parameter_required_specifier: {
+        type: 'string',
+        description: 'the object(s) to move'
+      },
+      to_required_location_specifier: {
+        type: 'string',
+        description: 'The new location for the object(s).'
+      }
+    },
+    required: ['direct_parameter_required_specifier', 'to_required_location_specifier'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'print_for_document',
+  description: 'Print a document.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_document_required_string: {
+        type: 'string',
+        description: 'The document object to access (e.g., \"front document\", \"document 1\")'
+      }
+    },
+    required: ['target_document_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'print_for_tab_of_window',
+  description: 'Print a tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'print_for_window',
+  description: 'Print a window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_given_name_of_window',
+  description: 'Get The given name of the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_given_name_of_window',
+  description: 'Set The given name of the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_text: {
+        type: 'string',
+        description: 'New value for The given name of the window.'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_text'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_minimizable_of_window',
+  description: 'Get Whether the window can be minimized.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_minimized_of_window',
+  description: 'Get Whether the window is currently minimized.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_minimized_of_window',
+  description: 'Set Whether the window is currently minimized.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_boolean: {
+        type: 'boolean',
+        description: 'New value for Whether the window is currently minimized.'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_boolean'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_active_tab_of_window',
+  description: 'Get Returns the currently selected tab of window',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_mode_of_window',
+  description: 'Get Represents the mode of the window which can be \'normal\' or \'incognito\', can be set only once during creation of the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_mode_of_window',
+  description: 'Set Represents the mode of the window which can be \'normal\' or \'incognito\', can be set only once during creation of the window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_text: {
+        type: 'string',
+        description: 'New value for Represents the mode of the window which can be \'normal\' or \'incognito\', can be set only once during creation of the window.'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_text'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_active_tab_index_of_window',
+  description: 'Get The index of the active tab. of window',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_active_tab_index_of_window',
+  description: 'Set The index of the active tab. of window',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_integer: {
+        type: 'number',
+        description: 'New value for The index of the active tab.'
+      }
+    },
+    required: ['target_window_required_string', 'value_required_integer'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'reload_for_tab_of_window',
+  description: 'Reload a tab.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'go_back_for_tab_of_window',
+  description: 'Go Back (If Possible) for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'go_forward_for_tab_of_window',
+  description: 'Go Forward (If Possible) for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'select_all_for_tab_of_window',
+  description: 'Select all for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'cut_selection_for_tab_of_window',
+  description: 'Cut selected text (If Possible) for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'copy_selection_for_tab_of_window',
+  description: 'Copy text for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'paste_selection_for_tab_of_window',
+  description: 'Paste text (If Possible) for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'undo_for_tab_of_window',
+  description: 'Undo the last change for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'redo_for_tab_of_window',
+  description: 'Redo the last change for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'stop_for_tab_of_window',
+  description: 'Stop the current tab from loading.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'view_source_for_tab_of_window',
+  description: 'View the HTML source of the tab.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'execute_for_tab_of_window',
+  description: 'Execute a piece of javascript for tab of window.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      javascript_required_text: {
+        type: 'string',
+        description: 'The javascript code to execute.'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string', 'javascript_required_text'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_bookmarks_bar_of_application',
+  description: 'Get The bookmarks bar bookmark folder. of application',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_other_bookmarks_of_application',
+  description: 'Get The other bookmarks bookmark folder. of application',
+  inputSchema: {
+    type: 'object',
+    properties: {
+    },
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_id_of_tab_of_window',
+  description: 'Get Unique ID of the tab.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_title_of_tab_of_window',
+  description: 'Get The title of the tab.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_url_of_tab_of_window',
+  description: 'Get The url visible to the user. of tab',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_url_of_tab_of_window',
+  description: 'Set The url visible to the user. of tab',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      },
+      value_required_text: {
+        type: 'string',
+        description: 'New value for The url visible to the user.'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string', 'value_required_text'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_loading_of_tab_of_window',
+  description: 'Get Is loading? of tab',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_tab_required_string: {
+        type: 'string',
+        description: 'The tab object to access (e.g., \"front tab\", \"tab 1\")'
+      },
+      target_window_required_string: {
+        type: 'string',
+        description: 'The window object to access (e.g., \"front window\", \"window 1\")'
+      }
+    },
+    required: ['target_tab_required_string', 'target_window_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_id_of_bookmark_folder',
+  description: 'Get Unique ID of the bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_title_of_bookmark_folder',
+  description: 'Get The title of the folder. of bookmark folder',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_title_of_bookmark_folder',
+  description: 'Set The title of the folder. of bookmark folder',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      },
+      value_required_text: {
+        type: 'string',
+        description: 'New value for The title of the folder.'
+      }
+    },
+    required: ['target_bookmark_folder_required_string', 'value_required_text'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_index_of_bookmark_folder',
+  description: 'Get Returns the index with respect to its parent bookmark folder.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_id_of_bookmark_item_of_bookmark_folder',
+  description: 'Get Unique ID of the bookmark item.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_item_required_string: {
+        type: 'string',
+        description: 'The bookmark item object to access (e.g., \"front bookmark item\", \"bookmark item 1\")'
+      },
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_item_required_string', 'target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_title_of_bookmark_item_of_bookmark_folder',
+  description: 'Get The title of the bookmark item.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_item_required_string: {
+        type: 'string',
+        description: 'The bookmark item object to access (e.g., \"front bookmark item\", \"bookmark item 1\")'
+      },
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_item_required_string', 'target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_title_of_bookmark_item_of_bookmark_folder',
+  description: 'Set The title of the bookmark item.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_item_required_string: {
+        type: 'string',
+        description: 'The bookmark item object to access (e.g., \"front bookmark item\", \"bookmark item 1\")'
+      },
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      },
+      value_required_text: {
+        type: 'string',
+        description: 'New value for The title of the bookmark item.'
+      }
+    },
+    required: ['target_bookmark_item_required_string', 'target_bookmark_folder_required_string', 'value_required_text'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_url_of_bookmark_item_of_bookmark_folder',
+  description: 'Get The URL of the bookmark. of bookmark item',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_item_required_string: {
+        type: 'string',
+        description: 'The bookmark item object to access (e.g., \"front bookmark item\", \"bookmark item 1\")'
+      },
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_item_required_string', 'target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'set_url_of_bookmark_item_of_bookmark_folder',
+  description: 'Set The URL of the bookmark. of bookmark item',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_item_required_string: {
+        type: 'string',
+        description: 'The bookmark item object to access (e.g., \"front bookmark item\", \"bookmark item 1\")'
+      },
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      },
+      value_required_text: {
+        type: 'string',
+        description: 'New value for The URL of the bookmark.'
+      }
+    },
+    required: ['target_bookmark_item_required_string', 'target_bookmark_folder_required_string', 'value_required_text'],
+    additionalProperties: false
+  }
+},
+          {
+  name: 'get_index_of_bookmark_item_of_bookmark_folder',
+  description: 'Get Returns the index with respect to its parent bookmark folder. of bookmark item',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      target_bookmark_item_required_string: {
+        type: 'string',
+        description: 'The bookmark item object to access (e.g., \"front bookmark item\", \"bookmark item 1\")'
+      },
+      target_bookmark_folder_required_string: {
+        type: 'string',
+        description: 'The bookmark folder object to access (e.g., \"front bookmark folder\", \"bookmark folder 1\")'
+      }
+    },
+    required: ['target_bookmark_item_required_string', 'target_bookmark_folder_required_string'],
+    additionalProperties: false
+  }
+},
+        ]
+      }
+    };
+    this.sendResponse(response);
+  }
+
+  async handleToolsCall(request) {
+    console.error("Handling tools/call request for:", request.params.name);
+    
+    try {
+      // Check app availability for all functions
+      {
+        const isBraveBrowserAvailable = await checkBraveBrowserAvailable();
+        if (!isBraveBrowserAvailable) {
+          const errorResponse = {
+            jsonrpc: '2.0',
+            id: request.id,
+            result: {
+              content: [{
+                type: 'text',
+                text: JSON.stringify({
+                  success: false,
+                  error: 'Application is not available or not running'
+                }, null, 2)
+              }]
+            }
+          };
+          this.sendResponse(errorResponse);
+          return;
+        }
+      }
+
+      const { name, arguments: args } = request.params;
+      let result;
+
+      switch (name) {
+        case 'open':
+  result = await this.open(args.direct_parameter_required_file);
+  break;
+        case 'close_for_document':
+  result = await this.closeForDocument(args.target_document_required_string, args.saving_optional_save_options, args.saving_in_optional_file);
+  break;
+        case 'close_for_tab_of_window':
+  result = await this.closeForTabOfWindow(args.target_tab_required_string, args.target_window_required_string, args.saving_optional_save_options, args.saving_in_optional_file);
+  break;
+        case 'close_for_window':
+  result = await this.closeForWindow(args.target_window_required_string, args.saving_optional_save_options, args.saving_in_optional_file);
+  break;
+        case 'save_for_document':
+  result = await this.saveForDocument(args.target_document_required_string, args.inParam_optional_file, args.as_optional_saveable_file_format);
+  break;
+        case 'save_for_tab_of_window':
+  result = await this.saveForTabOfWindow(args.target_tab_required_string, args.target_window_required_string, args.inParam_optional_file, args.as_optional_saveable_file_format);
+  break;
+        case 'save_for_window':
+  result = await this.saveForWindow(args.target_window_required_string, args.inParam_optional_file, args.as_optional_saveable_file_format);
+  break;
+        case 'print_file':
+  result = await this.printFile(args.direct_parameter_required_list_of_file, args.with_properties_optional_print_settings, args.print_dialog_optional_boolean);
+  break;
+        case 'print_for_document':
+  result = await this.printForDocument(args.target_document_required_string, args.with_properties_optional_print_settings, args.print_dialog_optional_boolean);
+  break;
+        case 'print_for_tab_of_window':
+  result = await this.printForTabOfWindow(args.target_tab_required_string, args.target_window_required_string, args.with_properties_optional_print_settings, args.print_dialog_optional_boolean);
+  break;
+        case 'print_for_window':
+  result = await this.printForWindow(args.target_window_required_string, args.with_properties_optional_print_settings, args.print_dialog_optional_boolean);
+  break;
+        case 'quit':
+  result = await this.quit(args.saving_optional_save_options);
+  break;
+        case 'count_document':
+  result = await this.countDocument();
+  break;
+        case 'count_bookmark_item_of_bookmark_folder':
+  result = await this.countBookmarkItemOfBookmarkFolder(args.target_bookmark_folder_required_string);
+  break;
+        case 'count_tab_of_window':
+  result = await this.countTabOfWindow(args.target_window_required_string);
+  break;
+        case 'count_window':
+  result = await this.countWindow();
+  break;
+        case 'count_bookmark_folder':
+  result = await this.countBookmarkFolder();
+  break;
+        case 'delete':
+  result = await this.delete(args.direct_parameter_required_specifier);
+  break;
+        case 'duplicate':
+  result = await this.duplicate(args.direct_parameter_required_specifier, args.to_optional_location_specifier, args.with_properties_optional_record);
+  break;
+        case 'exists':
+  result = await this.exists(args.direct_parameter_required_any);
+  break;
+        case 'make_document':
+  result = await this.makeDocument(args.at_optional_location_specifier, args.with_data_optional_any);
+  break;
+        case 'make_bookmark_item_of_bookmark_folder':
+  result = await this.makeBookmarkItemOfBookmarkFolder(args.at_required_location_specifier_bookmark_folder, args.with_data_optional_any, args.with_properties_optional_text_title, args.with_properties_optional_text_url);
+  break;
+        case 'make_tab_of_window':
+  result = await this.makeTabOfWindow(args.at_required_location_specifier_window, args.with_data_optional_any, args.with_properties_optional_text_url);
+  break;
+        case 'make_window':
+  result = await this.makeWindow(args.at_optional_location_specifier, args.with_data_optional_any, args.with_properties_optional_integer_index, args.with_properties_optional_text_given_name, args.with_properties_optional_boolean_zoomed, args.with_properties_optional_integer_active_tab_index, args.with_properties_optional_boolean_miniaturized, args.with_properties_optional_boolean_minimized, args.with_properties_optional_boolean_visible, args.with_properties_optional_text_mode, args.with_properties_optional_rectangle_bounds);
+  break;
+        case 'make_bookmark_folder':
+  result = await this.makeBookmarkFolder(args.at_optional_location_specifier, args.with_data_optional_any, args.with_properties_optional_text_title);
+  break;
+        case 'move':
+  result = await this.move(args.direct_parameter_required_specifier, args.to_required_location_specifier);
+  break;
+        case 'get_name_of_application':
+  result = await this.getNameOfApplication();
+  break;
+        case 'get_frontmost_of_application':
+  result = await this.getFrontmostOfApplication();
+  break;
+        case 'get_version_of_application':
+  result = await this.getVersionOfApplication();
+  break;
+        case 'get_name_of_document':
+  result = await this.getNameOfDocument(args.target_document_required_string);
+  break;
+        case 'get_modified_of_document':
+  result = await this.getModifiedOfDocument(args.target_document_required_string);
+  break;
+        case 'get_file_of_document':
+  result = await this.getFileOfDocument(args.target_document_required_string);
+  break;
+        case 'get_name_of_window':
+  result = await this.getNameOfWindow(args.target_window_required_string);
+  break;
+        case 'get_id_of_window':
+  result = await this.getIdOfWindow(args.target_window_required_string);
+  break;
+        case 'get_index_of_window':
+  result = await this.getIndexOfWindow(args.target_window_required_string);
+  break;
+        case 'set_index_of_window':
+  result = await this.setIndexOfWindow(args.target_window_required_string, args.value_required_integer);
+  break;
+        case 'get_bounds_of_window':
+  result = await this.getBoundsOfWindow(args.target_window_required_string);
+  break;
+        case 'set_bounds_of_window':
+  result = await this.setBoundsOfWindow(args.target_window_required_string, args.value_required_rectangle);
+  break;
+        case 'get_closeable_of_window':
+  result = await this.getCloseableOfWindow(args.target_window_required_string);
+  break;
+        case 'get_miniaturizable_of_window':
+  result = await this.getMiniaturizableOfWindow(args.target_window_required_string);
+  break;
+        case 'get_miniaturized_of_window':
+  result = await this.getMiniaturizedOfWindow(args.target_window_required_string);
+  break;
+        case 'set_miniaturized_of_window':
+  result = await this.setMiniaturizedOfWindow(args.target_window_required_string, args.value_required_boolean);
+  break;
+        case 'get_resizable_of_window':
+  result = await this.getResizableOfWindow(args.target_window_required_string);
+  break;
+        case 'get_visible_of_window':
+  result = await this.getVisibleOfWindow(args.target_window_required_string);
+  break;
+        case 'set_visible_of_window':
+  result = await this.setVisibleOfWindow(args.target_window_required_string, args.value_required_boolean);
+  break;
+        case 'get_zoomable_of_window':
+  result = await this.getZoomableOfWindow(args.target_window_required_string);
+  break;
+        case 'get_zoomed_of_window':
+  result = await this.getZoomedOfWindow(args.target_window_required_string);
+  break;
+        case 'set_zoomed_of_window':
+  result = await this.setZoomedOfWindow(args.target_window_required_string, args.value_required_boolean);
+  break;
+        case 'get_document_of_window':
+  result = await this.getDocumentOfWindow(args.target_window_required_string);
+  break;
+        case 'save_for_document':
+  result = await this.saveForDocument(args.target_document_required_string, args.inParam_optional_file, args.as_optional_text);
+  break;
+        case 'save_for_tab_of_window':
+  result = await this.saveForTabOfWindow(args.target_tab_required_string, args.target_window_required_string, args.inParam_optional_file, args.as_optional_text);
+  break;
+        case 'save_for_window':
+  result = await this.saveForWindow(args.target_window_required_string, args.inParam_optional_file, args.as_optional_text);
+  break;
+        case 'open':
+  result = await this.open(args.direct_parameter_required_list_of_file);
+  break;
+        case 'close_for_document':
+  result = await this.closeForDocument(args.target_document_required_string);
+  break;
+        case 'close_for_tab_of_window':
+  result = await this.closeForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'close_for_window':
+  result = await this.closeForWindow(args.target_window_required_string);
+  break;
+        case 'quit':
+  result = await this.quit();
+  break;
+        case 'count_document':
+  result = await this.countDocument();
+  break;
+        case 'count_bookmark_item_of_bookmark_folder':
+  result = await this.countBookmarkItemOfBookmarkFolder(args.target_bookmark_folder_required_string);
+  break;
+        case 'count_tab_of_window':
+  result = await this.countTabOfWindow(args.target_window_required_string);
+  break;
+        case 'count_window':
+  result = await this.countWindow();
+  break;
+        case 'count_bookmark_folder':
+  result = await this.countBookmarkFolder();
+  break;
+        case 'delete':
+  result = await this.delete(args.direct_parameter_required_specifier);
+  break;
+        case 'duplicate':
+  result = await this.duplicate(args.direct_parameter_required_specifier, args.to_optional_location_specifier, args.with_properties_optional_record);
+  break;
+        case 'exists':
+  result = await this.exists(args.direct_parameter_required_any);
+  break;
+        case 'make_document':
+  result = await this.makeDocument(args.at_optional_location_specifier, args.with_data_optional_any);
+  break;
+        case 'make_bookmark_item_of_bookmark_folder':
+  result = await this.makeBookmarkItemOfBookmarkFolder(args.at_required_location_specifier_bookmark_folder, args.with_data_optional_any, args.with_properties_optional_text_title, args.with_properties_optional_text_url);
+  break;
+        case 'make_tab_of_window':
+  result = await this.makeTabOfWindow(args.at_required_location_specifier_window, args.with_data_optional_any, args.with_properties_optional_text_url);
+  break;
+        case 'make_window':
+  result = await this.makeWindow(args.at_optional_location_specifier, args.with_data_optional_any, args.with_properties_optional_integer_index, args.with_properties_optional_text_given_name, args.with_properties_optional_boolean_zoomed, args.with_properties_optional_integer_active_tab_index, args.with_properties_optional_boolean_miniaturized, args.with_properties_optional_boolean_minimized, args.with_properties_optional_boolean_visible, args.with_properties_optional_text_mode, args.with_properties_optional_rectangle_bounds);
+  break;
+        case 'make_bookmark_folder':
+  result = await this.makeBookmarkFolder(args.at_optional_location_specifier, args.with_data_optional_any, args.with_properties_optional_text_title);
+  break;
+        case 'move':
+  result = await this.move(args.direct_parameter_required_specifier, args.to_required_location_specifier);
+  break;
+        case 'print_for_document':
+  result = await this.printForDocument(args.target_document_required_string);
+  break;
+        case 'print_for_tab_of_window':
+  result = await this.printForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'print_for_window':
+  result = await this.printForWindow(args.target_window_required_string);
+  break;
+        case 'get_given_name_of_window':
+  result = await this.getGivenNameOfWindow(args.target_window_required_string);
+  break;
+        case 'set_given_name_of_window':
+  result = await this.setGivenNameOfWindow(args.target_window_required_string, args.value_required_text);
+  break;
+        case 'get_minimizable_of_window':
+  result = await this.getMinimizableOfWindow(args.target_window_required_string);
+  break;
+        case 'get_minimized_of_window':
+  result = await this.getMinimizedOfWindow(args.target_window_required_string);
+  break;
+        case 'set_minimized_of_window':
+  result = await this.setMinimizedOfWindow(args.target_window_required_string, args.value_required_boolean);
+  break;
+        case 'get_active_tab_of_window':
+  result = await this.getActiveTabOfWindow(args.target_window_required_string);
+  break;
+        case 'get_mode_of_window':
+  result = await this.getModeOfWindow(args.target_window_required_string);
+  break;
+        case 'set_mode_of_window':
+  result = await this.setModeOfWindow(args.target_window_required_string, args.value_required_text);
+  break;
+        case 'get_active_tab_index_of_window':
+  result = await this.getActiveTabIndexOfWindow(args.target_window_required_string);
+  break;
+        case 'set_active_tab_index_of_window':
+  result = await this.setActiveTabIndexOfWindow(args.target_window_required_string, args.value_required_integer);
+  break;
+        case 'reload_for_tab_of_window':
+  result = await this.reloadForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'go_back_for_tab_of_window':
+  result = await this.goBackForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'go_forward_for_tab_of_window':
+  result = await this.goForwardForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'select_all_for_tab_of_window':
+  result = await this.selectAllForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'cut_selection_for_tab_of_window':
+  result = await this.cutSelectionForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'copy_selection_for_tab_of_window':
+  result = await this.copySelectionForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'paste_selection_for_tab_of_window':
+  result = await this.pasteSelectionForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'undo_for_tab_of_window':
+  result = await this.undoForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'redo_for_tab_of_window':
+  result = await this.redoForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'stop_for_tab_of_window':
+  result = await this.stopForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'view_source_for_tab_of_window':
+  result = await this.viewSourceForTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'execute_for_tab_of_window':
+  result = await this.executeForTabOfWindow(args.target_tab_required_string, args.target_window_required_string, args.javascript_required_text);
+  break;
+        case 'get_bookmarks_bar_of_application':
+  result = await this.getBookmarksBarOfApplication();
+  break;
+        case 'get_other_bookmarks_of_application':
+  result = await this.getOtherBookmarksOfApplication();
+  break;
+        case 'get_id_of_tab_of_window':
+  result = await this.getIdOfTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'get_title_of_tab_of_window':
+  result = await this.getTitleOfTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'get_url_of_tab_of_window':
+  result = await this.getUrlOfTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'set_url_of_tab_of_window':
+  result = await this.setUrlOfTabOfWindow(args.target_tab_required_string, args.target_window_required_string, args.value_required_text);
+  break;
+        case 'get_loading_of_tab_of_window':
+  result = await this.getLoadingOfTabOfWindow(args.target_tab_required_string, args.target_window_required_string);
+  break;
+        case 'get_id_of_bookmark_folder':
+  result = await this.getIdOfBookmarkFolder(args.target_bookmark_folder_required_string);
+  break;
+        case 'get_title_of_bookmark_folder':
+  result = await this.getTitleOfBookmarkFolder(args.target_bookmark_folder_required_string);
+  break;
+        case 'set_title_of_bookmark_folder':
+  result = await this.setTitleOfBookmarkFolder(args.target_bookmark_folder_required_string, args.value_required_text);
+  break;
+        case 'get_index_of_bookmark_folder':
+  result = await this.getIndexOfBookmarkFolder(args.target_bookmark_folder_required_string);
+  break;
+        case 'get_id_of_bookmark_item_of_bookmark_folder':
+  result = await this.getIdOfBookmarkItemOfBookmarkFolder(args.target_bookmark_item_required_string, args.target_bookmark_folder_required_string);
+  break;
+        case 'get_title_of_bookmark_item_of_bookmark_folder':
+  result = await this.getTitleOfBookmarkItemOfBookmarkFolder(args.target_bookmark_item_required_string, args.target_bookmark_folder_required_string);
+  break;
+        case 'set_title_of_bookmark_item_of_bookmark_folder':
+  result = await this.setTitleOfBookmarkItemOfBookmarkFolder(args.target_bookmark_item_required_string, args.target_bookmark_folder_required_string, args.value_required_text);
+  break;
+        case 'get_url_of_bookmark_item_of_bookmark_folder':
+  result = await this.getUrlOfBookmarkItemOfBookmarkFolder(args.target_bookmark_item_required_string, args.target_bookmark_folder_required_string);
+  break;
+        case 'set_url_of_bookmark_item_of_bookmark_folder':
+  result = await this.setUrlOfBookmarkItemOfBookmarkFolder(args.target_bookmark_item_required_string, args.target_bookmark_folder_required_string, args.value_required_text);
+  break;
+        case 'get_index_of_bookmark_item_of_bookmark_folder':
+  result = await this.getIndexOfBookmarkItemOfBookmarkFolder(args.target_bookmark_item_required_string, args.target_bookmark_folder_required_string);
+  break;
+        default:
+          throw new Error(`Unknown tool: ${name}`);
+      }
+
+      const response = {
+        jsonrpc: '2.0',
+        id: request.id,
+        result: {
+          content: [{
+            type: 'text',
+            text: JSON.stringify(result, null, 2)
+          }]
+        }
+      };
+      this.sendResponse(response);
+
+    } catch (error) {
+      console.error(`Error in tool '${request.params.name}':`, error);
+      const errorResponse = {
+        jsonrpc: '2.0',
+        id: request.id,
+        result: {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: error.message,
+              tool: request.params.name,
+              args: request.params.arguments
+            }, null, 2)
+          }]
+        }
+      };
+      this.sendResponse(errorResponse);
+    }
+  }
+
+  async open(direct_parameter_required_file) {
+    if (direct_parameter_required_file === undefined || direct_parameter_required_file === null) {
+      throw new Error("direct_parameter_required_file is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_file ? castAndEscape(direct_parameter_required_file) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        open "${castedDirect_parameter}"
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_file || null
+    };
+  }
+
+  async closeForDocument(target_document_required_string, saving_optional_save_options, saving_in_optional_file) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const castedDocument = castAndEscape(target_document_required_string);
+    const castedSaving = saving_optional_save_options ? castAndEscape(saving_optional_save_options) : null;
+    const valueForScriptSaving = castedSaving && typeof castedSaving === 'string' && !castedSaving.startsWith('{') && !castedSaving.startsWith('date') ? `"${castedSaving.replace(/"/g, "'")}"` : castedSaving;
+    const castedSaving_in = saving_in_optional_file ? castAndEscape(saving_in_optional_file) : null;
+    const valueForScriptSaving_in = castedSaving_in && typeof castedSaving_in === 'string' && !castedSaving_in.startsWith('{') && !castedSaving_in.startsWith('date') ? `"${castedSaving_in.replace(/"/g, "'")}"` : castedSaving_in;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        close ${castedDocument}${saving_optional_save_options ? ' saving ' + valueForScriptSaving : ''}${saving_in_optional_file ? ' saving in ' + valueForScriptSaving_in : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      document: target_document_required_string,
+      saving: saving_optional_save_options || null,
+      saving_in: saving_in_optional_file || null
+    };
+  }
+
+  async closeForTabOfWindow(target_tab_required_string, target_window_required_string, saving_optional_save_options, saving_in_optional_file) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedSaving = saving_optional_save_options ? castAndEscape(saving_optional_save_options) : null;
+    const valueForScriptSaving = castedSaving && typeof castedSaving === 'string' && !castedSaving.startsWith('{') && !castedSaving.startsWith('date') ? `"${castedSaving.replace(/"/g, "'")}"` : castedSaving;
+    const castedSaving_in = saving_in_optional_file ? castAndEscape(saving_in_optional_file) : null;
+    const valueForScriptSaving_in = castedSaving_in && typeof castedSaving_in === 'string' && !castedSaving_in.startsWith('{') && !castedSaving_in.startsWith('date') ? `"${castedSaving_in.replace(/"/g, "'")}"` : castedSaving_in;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        close (${castedTab} of ${castedWindow})${saving_optional_save_options ? ' saving ' + valueForScriptSaving : ''}${saving_in_optional_file ? ' saving in ' + valueForScriptSaving_in : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string,
+      saving: saving_optional_save_options || null,
+      saving_in: saving_in_optional_file || null
+    };
+  }
+
+  async closeForWindow(target_window_required_string, saving_optional_save_options, saving_in_optional_file) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedSaving = saving_optional_save_options ? castAndEscape(saving_optional_save_options) : null;
+    const valueForScriptSaving = castedSaving && typeof castedSaving === 'string' && !castedSaving.startsWith('{') && !castedSaving.startsWith('date') ? `"${castedSaving.replace(/"/g, "'")}"` : castedSaving;
+    const castedSaving_in = saving_in_optional_file ? castAndEscape(saving_in_optional_file) : null;
+    const valueForScriptSaving_in = castedSaving_in && typeof castedSaving_in === 'string' && !castedSaving_in.startsWith('{') && !castedSaving_in.startsWith('date') ? `"${castedSaving_in.replace(/"/g, "'")}"` : castedSaving_in;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        close ${castedWindow}${saving_optional_save_options ? ' saving ' + valueForScriptSaving : ''}${saving_in_optional_file ? ' saving in ' + valueForScriptSaving_in : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: target_window_required_string,
+      saving: saving_optional_save_options || null,
+      saving_in: saving_in_optional_file || null
+    };
+  }
+
+  async saveForDocument(target_document_required_string, inParam_optional_file, as_optional_saveable_file_format) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const castedDocument = castAndEscape(target_document_required_string);
+    const castedIn = inParam_optional_file ? castAndEscape(inParam_optional_file) : null;
+    const valueForScriptIn = castedIn && typeof castedIn === 'string' && !castedIn.startsWith('{') && !castedIn.startsWith('date') ? `"${castedIn.replace(/"/g, "'")}"` : castedIn;
+    const castedAs = as_optional_saveable_file_format ? castAndEscape(as_optional_saveable_file_format) : null;
+    const valueForScriptAs = castedAs && typeof castedAs === 'string' && !castedAs.startsWith('{') && !castedAs.startsWith('date') ? `"${castedAs.replace(/"/g, "'")}"` : castedAs;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        save ${castedDocument}${inParam_optional_file ? ' in ' + valueForScriptIn : ''}${as_optional_saveable_file_format ? ' as ' + valueForScriptAs : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      document: target_document_required_string,
+      in: inParam_optional_file || null,
+      as: as_optional_saveable_file_format || null
+    };
+  }
+
+  async saveForTabOfWindow(target_tab_required_string, target_window_required_string, inParam_optional_file, as_optional_saveable_file_format) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedIn = inParam_optional_file ? castAndEscape(inParam_optional_file) : null;
+    const valueForScriptIn = castedIn && typeof castedIn === 'string' && !castedIn.startsWith('{') && !castedIn.startsWith('date') ? `"${castedIn.replace(/"/g, "'")}"` : castedIn;
+    const castedAs = as_optional_saveable_file_format ? castAndEscape(as_optional_saveable_file_format) : null;
+    const valueForScriptAs = castedAs && typeof castedAs === 'string' && !castedAs.startsWith('{') && !castedAs.startsWith('date') ? `"${castedAs.replace(/"/g, "'")}"` : castedAs;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        save (${castedTab} of ${castedWindow})${inParam_optional_file ? ' in ' + valueForScriptIn : ''}${as_optional_saveable_file_format ? ' as ' + valueForScriptAs : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string,
+      in: inParam_optional_file || null,
+      as: as_optional_saveable_file_format || null
+    };
+  }
+
+  async saveForWindow(target_window_required_string, inParam_optional_file, as_optional_saveable_file_format) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedIn = inParam_optional_file ? castAndEscape(inParam_optional_file) : null;
+    const valueForScriptIn = castedIn && typeof castedIn === 'string' && !castedIn.startsWith('{') && !castedIn.startsWith('date') ? `"${castedIn.replace(/"/g, "'")}"` : castedIn;
+    const castedAs = as_optional_saveable_file_format ? castAndEscape(as_optional_saveable_file_format) : null;
+    const valueForScriptAs = castedAs && typeof castedAs === 'string' && !castedAs.startsWith('{') && !castedAs.startsWith('date') ? `"${castedAs.replace(/"/g, "'")}"` : castedAs;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        save ${castedWindow}${inParam_optional_file ? ' in ' + valueForScriptIn : ''}${as_optional_saveable_file_format ? ' as ' + valueForScriptAs : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: target_window_required_string,
+      in: inParam_optional_file || null,
+      as: as_optional_saveable_file_format || null
+    };
+  }
+
+  async printFile(direct_parameter_required_list_of_file, with_properties_optional_print_settings, print_dialog_optional_boolean) {
+    if (direct_parameter_required_list_of_file === undefined || direct_parameter_required_list_of_file === null) {
+      throw new Error("direct_parameter_required_list_of_file is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_list_of_file ? castAndEscape(direct_parameter_required_list_of_file) : null;
+    const castedWith_properties = with_properties_optional_print_settings ? castAndEscape(with_properties_optional_print_settings) : null;
+    const castedPrint_dialog = print_dialog_optional_boolean ? castAndEscape(print_dialog_optional_boolean) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        print ${castedDirect_parameter}${with_properties_optional_print_settings ? ' with properties ' + castedWith_properties : ''}${print_dialog_optional_boolean ? ' print dialog ' + castedPrint_dialog : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_list_of_file || null,
+      with_properties: with_properties_optional_print_settings || null,
+      print_dialog: print_dialog_optional_boolean || null
+    };
+  }
+
+  async printForDocument(target_document_required_string, with_properties_optional_print_settings, print_dialog_optional_boolean) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const castedDocument = castAndEscape(target_document_required_string);
+    const castedWith_properties = with_properties_optional_print_settings ? castAndEscape(with_properties_optional_print_settings) : null;
+    const valueForScriptWith_properties = castedWith_properties && typeof castedWith_properties === 'string' && !castedWith_properties.startsWith('{') && !castedWith_properties.startsWith('date') ? `"${castedWith_properties.replace(/"/g, "'")}"` : castedWith_properties;
+    const castedPrint_dialog = print_dialog_optional_boolean ? castAndEscape(print_dialog_optional_boolean) : null;
+    const valueForScriptPrint_dialog = castedPrint_dialog && typeof castedPrint_dialog === 'string' && !castedPrint_dialog.startsWith('{') && !castedPrint_dialog.startsWith('date') ? `"${castedPrint_dialog.replace(/"/g, "'")}"` : castedPrint_dialog;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        print ${castedDocument}${with_properties_optional_print_settings ? ' with properties ' + valueForScriptWith_properties : ''}${print_dialog_optional_boolean ? ' print dialog ' + valueForScriptPrint_dialog : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      document: target_document_required_string,
+      with_properties: with_properties_optional_print_settings || null,
+      print_dialog: print_dialog_optional_boolean || null
+    };
+  }
+
+  async printForTabOfWindow(target_tab_required_string, target_window_required_string, with_properties_optional_print_settings, print_dialog_optional_boolean) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedWith_properties = with_properties_optional_print_settings ? castAndEscape(with_properties_optional_print_settings) : null;
+    const valueForScriptWith_properties = castedWith_properties && typeof castedWith_properties === 'string' && !castedWith_properties.startsWith('{') && !castedWith_properties.startsWith('date') ? `"${castedWith_properties.replace(/"/g, "'")}"` : castedWith_properties;
+    const castedPrint_dialog = print_dialog_optional_boolean ? castAndEscape(print_dialog_optional_boolean) : null;
+    const valueForScriptPrint_dialog = castedPrint_dialog && typeof castedPrint_dialog === 'string' && !castedPrint_dialog.startsWith('{') && !castedPrint_dialog.startsWith('date') ? `"${castedPrint_dialog.replace(/"/g, "'")}"` : castedPrint_dialog;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        print (${castedTab} of ${castedWindow})${with_properties_optional_print_settings ? ' with properties ' + valueForScriptWith_properties : ''}${print_dialog_optional_boolean ? ' print dialog ' + valueForScriptPrint_dialog : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string,
+      with_properties: with_properties_optional_print_settings || null,
+      print_dialog: print_dialog_optional_boolean || null
+    };
+  }
+
+  async printForWindow(target_window_required_string, with_properties_optional_print_settings, print_dialog_optional_boolean) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedWith_properties = with_properties_optional_print_settings ? castAndEscape(with_properties_optional_print_settings) : null;
+    const valueForScriptWith_properties = castedWith_properties && typeof castedWith_properties === 'string' && !castedWith_properties.startsWith('{') && !castedWith_properties.startsWith('date') ? `"${castedWith_properties.replace(/"/g, "'")}"` : castedWith_properties;
+    const castedPrint_dialog = print_dialog_optional_boolean ? castAndEscape(print_dialog_optional_boolean) : null;
+    const valueForScriptPrint_dialog = castedPrint_dialog && typeof castedPrint_dialog === 'string' && !castedPrint_dialog.startsWith('{') && !castedPrint_dialog.startsWith('date') ? `"${castedPrint_dialog.replace(/"/g, "'")}"` : castedPrint_dialog;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        print ${castedWindow}${with_properties_optional_print_settings ? ' with properties ' + valueForScriptWith_properties : ''}${print_dialog_optional_boolean ? ' print dialog ' + valueForScriptPrint_dialog : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: target_window_required_string,
+      with_properties: with_properties_optional_print_settings || null,
+      print_dialog: print_dialog_optional_boolean || null
+    };
+  }
+
+  async quit(saving_optional_save_options) {
+    const castedSaving = saving_optional_save_options ? castAndEscape(saving_optional_save_options) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        quit${saving_optional_save_options ? ' saving ' + castedSaving : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      saving: saving_optional_save_options || null
+    };
+  }
+
+  async countDocument() {
+
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each document 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script
+    };
+  }
+
+  async countBookmarkItemOfBookmarkFolder(target_bookmark_folder_required_string) {
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const castedBookmarkFolder = castAndEscape(target_bookmark_folder_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each bookmark item of ${castedBookmarkFolder} 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async countTabOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each tab of ${castedWindow} 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async countWindow() {
+
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each window 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script
+    };
+  }
+
+  async countBookmarkFolder() {
+
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each bookmark folder 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script
+    };
+  }
+
+  async delete(direct_parameter_required_specifier) {
+    if (direct_parameter_required_specifier === undefined || direct_parameter_required_specifier === null) {
+      throw new Error("direct_parameter_required_specifier is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_specifier ? castAndEscape(direct_parameter_required_specifier) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        delete ${castedDirect_parameter}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_specifier || null
+    };
+  }
+
+  async duplicate(direct_parameter_required_specifier, to_optional_location_specifier, with_properties_optional_record) {
+    if (direct_parameter_required_specifier === undefined || direct_parameter_required_specifier === null) {
+      throw new Error("direct_parameter_required_specifier is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_specifier ? castAndEscape(direct_parameter_required_specifier) : null;
+    const castedTo = to_optional_location_specifier ? castAndEscape(to_optional_location_specifier) : null;
+    const castedWith_properties = with_properties_optional_record ? castAndEscape(with_properties_optional_record) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        duplicate ${castedDirect_parameter}${to_optional_location_specifier ? ' to ' + castedTo : ''}${with_properties_optional_record ? ' with properties ' + castedWith_properties : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_specifier || null,
+      to: to_optional_location_specifier || null,
+      with_properties: with_properties_optional_record || null
+    };
+  }
+
+  async exists(direct_parameter_required_any) {
+    if (direct_parameter_required_any === undefined || direct_parameter_required_any === null) {
+      throw new Error("direct_parameter_required_any is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_any ? castAndEscape(direct_parameter_required_any) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        exists ${castedDirect_parameter}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_any || null
+    };
+  }
+
+  async makeDocument(at_optional_location_specifier, with_data_optional_any) {
+
+    const castedAt = at_optional_location_specifier ? castAndEscape(at_optional_location_specifier) : null;
+    const valueForScriptAt = castedAt && typeof castedAt === 'string' && !castedAt.startsWith('{') && !castedAt.startsWith('date') ? `"${castedAt.replace(/"/g, "'")}"` : castedAt;
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new document ${at_optional_location_specifier ? ' at ' + valueForScriptAt : ''}${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      at: at_optional_location_specifier || null,
+      with_data: with_data_optional_any || null
+    };
+  }
+
+  async makeBookmarkItemOfBookmarkFolder(at_required_location_specifier_bookmark_folder, with_data_optional_any, with_properties_optional_text_title, with_properties_optional_text_url) {
+    if (!at_required_location_specifier_bookmark_folder || typeof at_required_location_specifier_bookmark_folder !== "string") {
+      throw new Error("at_required_location_specifier_bookmark_folder is required and must be a string");
+    }
+
+    const castedBookmarkFolder = castAndEscape(at_required_location_specifier_bookmark_folder);
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+    const castedWith_properties_optional_text_title = with_properties_optional_text_title ? castAndEscape(with_properties_optional_text_title) : null;
+    const castedWith_properties_optional_text_url = with_properties_optional_text_url ? castAndEscape(with_properties_optional_text_url) : null;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new bookmark item at ${castedBookmarkFolder} ${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}${buildPropertiesRecord([{param: 'with_properties_optional_text_title', prop: 'title', value: with_properties_optional_text_title, type: 'text'}, {param: 'with_properties_optional_text_url', prop: 'URL', value: with_properties_optional_text_url, type: 'text'}])}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      bookmark_folder: at_required_location_specifier_bookmark_folder,
+      with_data: with_data_optional_any || null,
+      title: with_properties_optional_text_title || null,
+      url: with_properties_optional_text_url || null
+    };
+  }
+
+  async makeTabOfWindow(at_required_location_specifier_window, with_data_optional_any, with_properties_optional_text_url) {
+    if (!at_required_location_specifier_window || typeof at_required_location_specifier_window !== "string") {
+      throw new Error("at_required_location_specifier_window is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(at_required_location_specifier_window);
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+    const castedWith_properties_optional_text_url = with_properties_optional_text_url ? castAndEscape(with_properties_optional_text_url) : null;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new tab at ${castedWindow} ${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}${buildPropertiesRecord([{param: 'with_properties_optional_text_url', prop: 'URL', value: with_properties_optional_text_url, type: 'text'}])}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: at_required_location_specifier_window,
+      with_data: with_data_optional_any || null,
+      url: with_properties_optional_text_url || null
+    };
+  }
+
+  async makeWindow(at_optional_location_specifier, with_data_optional_any, with_properties_optional_integer_index, with_properties_optional_text_given_name, with_properties_optional_boolean_zoomed, with_properties_optional_integer_active_tab_index, with_properties_optional_boolean_miniaturized, with_properties_optional_boolean_minimized, with_properties_optional_boolean_visible, with_properties_optional_text_mode, with_properties_optional_rectangle_bounds) {
+
+    const castedAt = at_optional_location_specifier ? castAndEscape(at_optional_location_specifier) : null;
+    const valueForScriptAt = castedAt && typeof castedAt === 'string' && !castedAt.startsWith('{') && !castedAt.startsWith('date') ? `"${castedAt.replace(/"/g, "'")}"` : castedAt;
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+    const castedWith_properties_optional_integer_index = with_properties_optional_integer_index ? castAndEscape(with_properties_optional_integer_index) : null;
+    const castedWith_properties_optional_text_given_name = with_properties_optional_text_given_name ? castAndEscape(with_properties_optional_text_given_name) : null;
+    const castedWith_properties_optional_boolean_zoomed = with_properties_optional_boolean_zoomed ? castAndEscape(with_properties_optional_boolean_zoomed) : null;
+    const castedWith_properties_optional_integer_active_tab_index = with_properties_optional_integer_active_tab_index ? castAndEscape(with_properties_optional_integer_active_tab_index) : null;
+    const castedWith_properties_optional_boolean_miniaturized = with_properties_optional_boolean_miniaturized ? castAndEscape(with_properties_optional_boolean_miniaturized) : null;
+    const castedWith_properties_optional_boolean_minimized = with_properties_optional_boolean_minimized ? castAndEscape(with_properties_optional_boolean_minimized) : null;
+    const castedWith_properties_optional_boolean_visible = with_properties_optional_boolean_visible ? castAndEscape(with_properties_optional_boolean_visible) : null;
+    const castedWith_properties_optional_text_mode = with_properties_optional_text_mode ? castAndEscape(with_properties_optional_text_mode) : null;
+    const castedWith_properties_optional_rectangle_bounds = with_properties_optional_rectangle_bounds ? castAndEscape(with_properties_optional_rectangle_bounds) : null;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new window ${at_optional_location_specifier ? ' at ' + valueForScriptAt : ''}${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}${buildPropertiesRecord([{param: 'with_properties_optional_integer_index', prop: 'index', value: with_properties_optional_integer_index, type: 'integer'}, {param: 'with_properties_optional_text_given_name', prop: 'given name', value: with_properties_optional_text_given_name, type: 'text'}, {param: 'with_properties_optional_boolean_zoomed', prop: 'zoomed', value: with_properties_optional_boolean_zoomed, type: 'boolean'}, {param: 'with_properties_optional_integer_active_tab_index', prop: 'active tab index', value: with_properties_optional_integer_active_tab_index, type: 'integer'}, {param: 'with_properties_optional_boolean_miniaturized', prop: 'miniaturized', value: with_properties_optional_boolean_miniaturized, type: 'boolean'}, {param: 'with_properties_optional_boolean_minimized', prop: 'minimized', value: with_properties_optional_boolean_minimized, type: 'boolean'}, {param: 'with_properties_optional_boolean_visible', prop: 'visible', value: with_properties_optional_boolean_visible, type: 'boolean'}, {param: 'with_properties_optional_text_mode', prop: 'mode', value: with_properties_optional_text_mode, type: 'text'}, {param: 'with_properties_optional_rectangle_bounds', prop: 'bounds', value: with_properties_optional_rectangle_bounds, type: 'rectangle'}])}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      at: at_optional_location_specifier || null,
+      with_data: with_data_optional_any || null,
+      index: with_properties_optional_integer_index || null,
+      given_name: with_properties_optional_text_given_name || null,
+      zoomed: with_properties_optional_boolean_zoomed || null,
+      active_tab_index: with_properties_optional_integer_active_tab_index || null,
+      miniaturized: with_properties_optional_boolean_miniaturized || null,
+      minimized: with_properties_optional_boolean_minimized || null,
+      visible: with_properties_optional_boolean_visible || null,
+      mode: with_properties_optional_text_mode || null,
+      bounds: with_properties_optional_rectangle_bounds || null
+    };
+  }
+
+  async makeBookmarkFolder(at_optional_location_specifier, with_data_optional_any, with_properties_optional_text_title) {
+
+    const castedAt = at_optional_location_specifier ? castAndEscape(at_optional_location_specifier) : null;
+    const valueForScriptAt = castedAt && typeof castedAt === 'string' && !castedAt.startsWith('{') && !castedAt.startsWith('date') ? `"${castedAt.replace(/"/g, "'")}"` : castedAt;
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+    const castedWith_properties_optional_text_title = with_properties_optional_text_title ? castAndEscape(with_properties_optional_text_title) : null;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new bookmark folder ${at_optional_location_specifier ? ' at ' + valueForScriptAt : ''}${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}${buildPropertiesRecord([{param: 'with_properties_optional_text_title', prop: 'title', value: with_properties_optional_text_title, type: 'text'}])}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      at: at_optional_location_specifier || null,
+      with_data: with_data_optional_any || null,
+      title: with_properties_optional_text_title || null
+    };
+  }
+
+  async move(direct_parameter_required_specifier, to_required_location_specifier) {
+    if (direct_parameter_required_specifier === undefined || direct_parameter_required_specifier === null) {
+      throw new Error("direct_parameter_required_specifier is required");
+    }
+
+    if (to_required_location_specifier === undefined || to_required_location_specifier === null) {
+      throw new Error("to_required_location_specifier is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_specifier ? castAndEscape(direct_parameter_required_specifier) : null;
+    const castedTo = to_required_location_specifier ? castAndEscape(to_required_location_specifier) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        move ${castedDirect_parameter} to ${castedTo}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_specifier || null,
+      to: to_required_location_specifier || null
+    };
+  }
+
+  async getNameOfApplication() {
+    const script = `
+      tell application "Brave Browser"
+        return name
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script
+    };
+  }
+
+  async getFrontmostOfApplication() {
+    const script = `
+      tell application "Brave Browser"
+        return frontmost
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script
+    };
+  }
+
+  async getVersionOfApplication() {
+    const script = `
+      tell application "Brave Browser"
+        return version
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script
+    };
+  }
+
+  async getNameOfDocument(target_document_required_string) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const escapedDocument = escapeForAppleScript(target_document_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return name of ${escapedDocument}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      document: target_document_required_string
+    };
+  }
+
+  async getModifiedOfDocument(target_document_required_string) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const escapedDocument = escapeForAppleScript(target_document_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return modified of ${escapedDocument}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      document: target_document_required_string
+    };
+  }
+
+  async getFileOfDocument(target_document_required_string) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const escapedDocument = escapeForAppleScript(target_document_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return file of ${escapedDocument}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      document: target_document_required_string
+    };
+  }
+
+  async getNameOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return name of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getIdOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return id of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getIndexOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return index of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setIndexOfWindow(target_window_required_string, value_required_integer) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_integer === undefined || value_required_integer === null) {
+      throw new Error("value_required_integer is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_integer, 'integer');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set index of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_integer,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getBoundsOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return bounds of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setBoundsOfWindow(target_window_required_string, value_required_rectangle) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_rectangle === undefined || value_required_rectangle === null) {
+      throw new Error("value_required_rectangle is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_rectangle, 'rectangle');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set bounds of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_rectangle,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getCloseableOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return closeable of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getMiniaturizableOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return miniaturizable of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getMiniaturizedOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return miniaturized of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setMiniaturizedOfWindow(target_window_required_string, value_required_boolean) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_boolean === undefined || value_required_boolean === null) {
+      throw new Error("value_required_boolean is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_boolean, 'boolean');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set miniaturized of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_boolean,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getResizableOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return resizable of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getVisibleOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return visible of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setVisibleOfWindow(target_window_required_string, value_required_boolean) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_boolean === undefined || value_required_boolean === null) {
+      throw new Error("value_required_boolean is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_boolean, 'boolean');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set visible of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_boolean,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getZoomableOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return zoomable of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getZoomedOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return zoomed of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setZoomedOfWindow(target_window_required_string, value_required_boolean) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_boolean === undefined || value_required_boolean === null) {
+      throw new Error("value_required_boolean is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_boolean, 'boolean');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set zoomed of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_boolean,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getDocumentOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return document of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async saveForDocument(target_document_required_string, inParam_optional_file, as_optional_text) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const castedDocument = castAndEscape(target_document_required_string);
+    const castedIn = inParam_optional_file ? castAndEscape(inParam_optional_file) : null;
+    const valueForScriptIn = castedIn && typeof castedIn === 'string' && !castedIn.startsWith('{') && !castedIn.startsWith('date') ? `"${castedIn.replace(/"/g, "'")}"` : castedIn;
+    const castedAs = as_optional_text ? castAndEscape(as_optional_text) : null;
+    const valueForScriptAs = castedAs && typeof castedAs === 'string' && !castedAs.startsWith('{') && !castedAs.startsWith('date') ? `"${castedAs.replace(/"/g, "'")}"` : castedAs;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        save ${castedDocument}${inParam_optional_file ? ' in ' + valueForScriptIn : ''}${as_optional_text ? ' as ' + valueForScriptAs : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      document: target_document_required_string,
+      in: inParam_optional_file || null,
+      as: as_optional_text || null
+    };
+  }
+
+  async saveForTabOfWindow(target_tab_required_string, target_window_required_string, inParam_optional_file, as_optional_text) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedIn = inParam_optional_file ? castAndEscape(inParam_optional_file) : null;
+    const valueForScriptIn = castedIn && typeof castedIn === 'string' && !castedIn.startsWith('{') && !castedIn.startsWith('date') ? `"${castedIn.replace(/"/g, "'")}"` : castedIn;
+    const castedAs = as_optional_text ? castAndEscape(as_optional_text) : null;
+    const valueForScriptAs = castedAs && typeof castedAs === 'string' && !castedAs.startsWith('{') && !castedAs.startsWith('date') ? `"${castedAs.replace(/"/g, "'")}"` : castedAs;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        save (${castedTab} of ${castedWindow})${inParam_optional_file ? ' in ' + valueForScriptIn : ''}${as_optional_text ? ' as ' + valueForScriptAs : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string,
+      in: inParam_optional_file || null,
+      as: as_optional_text || null
+    };
+  }
+
+  async saveForWindow(target_window_required_string, inParam_optional_file, as_optional_text) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedIn = inParam_optional_file ? castAndEscape(inParam_optional_file) : null;
+    const valueForScriptIn = castedIn && typeof castedIn === 'string' && !castedIn.startsWith('{') && !castedIn.startsWith('date') ? `"${castedIn.replace(/"/g, "'")}"` : castedIn;
+    const castedAs = as_optional_text ? castAndEscape(as_optional_text) : null;
+    const valueForScriptAs = castedAs && typeof castedAs === 'string' && !castedAs.startsWith('{') && !castedAs.startsWith('date') ? `"${castedAs.replace(/"/g, "'")}"` : castedAs;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        save ${castedWindow}${inParam_optional_file ? ' in ' + valueForScriptIn : ''}${as_optional_text ? ' as ' + valueForScriptAs : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: target_window_required_string,
+      in: inParam_optional_file || null,
+      as: as_optional_text || null
+    };
+  }
+
+  async open(direct_parameter_required_list_of_file) {
+    if (direct_parameter_required_list_of_file === undefined || direct_parameter_required_list_of_file === null) {
+      throw new Error("direct_parameter_required_list_of_file is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_list_of_file ? castAndEscape(direct_parameter_required_list_of_file) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        open ${castedDirect_parameter}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_list_of_file || null
+    };
+  }
+
+  async closeForDocument(target_document_required_string) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const castedDocument = castAndEscape(target_document_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        close ${castedDocument}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      document: target_document_required_string
+    };
+  }
+
+  async closeForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        close (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async closeForWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        close ${castedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async quit() {
+    const script = `
+      tell application "Brave Browser"
+        quit
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script
+    };
+  }
+
+  async countDocument() {
+
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each document 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script
+    };
+  }
+
+  async countBookmarkItemOfBookmarkFolder(target_bookmark_folder_required_string) {
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const castedBookmarkFolder = castAndEscape(target_bookmark_folder_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each bookmark item of ${castedBookmarkFolder} 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async countTabOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each tab of ${castedWindow} 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async countWindow() {
+
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each window 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script
+    };
+  }
+
+  async countBookmarkFolder() {
+
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        count each bookmark folder 
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script
+    };
+  }
+
+  async delete(direct_parameter_required_specifier) {
+    if (direct_parameter_required_specifier === undefined || direct_parameter_required_specifier === null) {
+      throw new Error("direct_parameter_required_specifier is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_specifier ? castAndEscape(direct_parameter_required_specifier) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        delete ${castedDirect_parameter}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_specifier || null
+    };
+  }
+
+  async duplicate(direct_parameter_required_specifier, to_optional_location_specifier, with_properties_optional_record) {
+    if (direct_parameter_required_specifier === undefined || direct_parameter_required_specifier === null) {
+      throw new Error("direct_parameter_required_specifier is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_specifier ? castAndEscape(direct_parameter_required_specifier) : null;
+    const castedTo = to_optional_location_specifier ? castAndEscape(to_optional_location_specifier) : null;
+    const castedWith_properties = with_properties_optional_record ? castAndEscape(with_properties_optional_record) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        duplicate ${castedDirect_parameter}${to_optional_location_specifier ? ' to ' + castedTo : ''}${with_properties_optional_record ? ' with properties ' + castedWith_properties : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_specifier || null,
+      to: to_optional_location_specifier || null,
+      with_properties: with_properties_optional_record || null
+    };
+  }
+
+  async exists(direct_parameter_required_any) {
+    if (direct_parameter_required_any === undefined || direct_parameter_required_any === null) {
+      throw new Error("direct_parameter_required_any is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_any ? castAndEscape(direct_parameter_required_any) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        exists ${castedDirect_parameter}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_any || null
+    };
+  }
+
+  async makeDocument(at_optional_location_specifier, with_data_optional_any) {
+
+    const castedAt = at_optional_location_specifier ? castAndEscape(at_optional_location_specifier) : null;
+    const valueForScriptAt = castedAt && typeof castedAt === 'string' && !castedAt.startsWith('{') && !castedAt.startsWith('date') ? `"${castedAt.replace(/"/g, "'")}"` : castedAt;
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new document ${at_optional_location_specifier ? ' at ' + valueForScriptAt : ''}${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      at: at_optional_location_specifier || null,
+      with_data: with_data_optional_any || null
+    };
+  }
+
+  async makeBookmarkItemOfBookmarkFolder(at_required_location_specifier_bookmark_folder, with_data_optional_any, with_properties_optional_text_title, with_properties_optional_text_url) {
+    if (!at_required_location_specifier_bookmark_folder || typeof at_required_location_specifier_bookmark_folder !== "string") {
+      throw new Error("at_required_location_specifier_bookmark_folder is required and must be a string");
+    }
+
+    const castedBookmarkFolder = castAndEscape(at_required_location_specifier_bookmark_folder);
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+    const castedWith_properties_optional_text_title = with_properties_optional_text_title ? castAndEscape(with_properties_optional_text_title) : null;
+    const castedWith_properties_optional_text_url = with_properties_optional_text_url ? castAndEscape(with_properties_optional_text_url) : null;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new bookmark item at ${castedBookmarkFolder} ${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}${buildPropertiesRecord([{param: 'with_properties_optional_text_title', prop: 'title', value: with_properties_optional_text_title, type: 'text'}, {param: 'with_properties_optional_text_url', prop: 'URL', value: with_properties_optional_text_url, type: 'text'}])}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      bookmark_folder: at_required_location_specifier_bookmark_folder,
+      with_data: with_data_optional_any || null,
+      title: with_properties_optional_text_title || null,
+      url: with_properties_optional_text_url || null
+    };
+  }
+
+  async makeTabOfWindow(at_required_location_specifier_window, with_data_optional_any, with_properties_optional_text_url) {
+    if (!at_required_location_specifier_window || typeof at_required_location_specifier_window !== "string") {
+      throw new Error("at_required_location_specifier_window is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(at_required_location_specifier_window);
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+    const castedWith_properties_optional_text_url = with_properties_optional_text_url ? castAndEscape(with_properties_optional_text_url) : null;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new tab at ${castedWindow} ${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}${buildPropertiesRecord([{param: 'with_properties_optional_text_url', prop: 'URL', value: with_properties_optional_text_url, type: 'text'}])}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: at_required_location_specifier_window,
+      with_data: with_data_optional_any || null,
+      url: with_properties_optional_text_url || null
+    };
+  }
+
+  async makeWindow(at_optional_location_specifier, with_data_optional_any, with_properties_optional_integer_index, with_properties_optional_text_given_name, with_properties_optional_boolean_zoomed, with_properties_optional_integer_active_tab_index, with_properties_optional_boolean_miniaturized, with_properties_optional_boolean_minimized, with_properties_optional_boolean_visible, with_properties_optional_text_mode, with_properties_optional_rectangle_bounds) {
+
+    const castedAt = at_optional_location_specifier ? castAndEscape(at_optional_location_specifier) : null;
+    const valueForScriptAt = castedAt && typeof castedAt === 'string' && !castedAt.startsWith('{') && !castedAt.startsWith('date') ? `"${castedAt.replace(/"/g, "'")}"` : castedAt;
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+    const castedWith_properties_optional_integer_index = with_properties_optional_integer_index ? castAndEscape(with_properties_optional_integer_index) : null;
+    const castedWith_properties_optional_text_given_name = with_properties_optional_text_given_name ? castAndEscape(with_properties_optional_text_given_name) : null;
+    const castedWith_properties_optional_boolean_zoomed = with_properties_optional_boolean_zoomed ? castAndEscape(with_properties_optional_boolean_zoomed) : null;
+    const castedWith_properties_optional_integer_active_tab_index = with_properties_optional_integer_active_tab_index ? castAndEscape(with_properties_optional_integer_active_tab_index) : null;
+    const castedWith_properties_optional_boolean_miniaturized = with_properties_optional_boolean_miniaturized ? castAndEscape(with_properties_optional_boolean_miniaturized) : null;
+    const castedWith_properties_optional_boolean_minimized = with_properties_optional_boolean_minimized ? castAndEscape(with_properties_optional_boolean_minimized) : null;
+    const castedWith_properties_optional_boolean_visible = with_properties_optional_boolean_visible ? castAndEscape(with_properties_optional_boolean_visible) : null;
+    const castedWith_properties_optional_text_mode = with_properties_optional_text_mode ? castAndEscape(with_properties_optional_text_mode) : null;
+    const castedWith_properties_optional_rectangle_bounds = with_properties_optional_rectangle_bounds ? castAndEscape(with_properties_optional_rectangle_bounds) : null;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new window ${at_optional_location_specifier ? ' at ' + valueForScriptAt : ''}${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}${buildPropertiesRecord([{param: 'with_properties_optional_integer_index', prop: 'index', value: with_properties_optional_integer_index, type: 'integer'}, {param: 'with_properties_optional_text_given_name', prop: 'given name', value: with_properties_optional_text_given_name, type: 'text'}, {param: 'with_properties_optional_boolean_zoomed', prop: 'zoomed', value: with_properties_optional_boolean_zoomed, type: 'boolean'}, {param: 'with_properties_optional_integer_active_tab_index', prop: 'active tab index', value: with_properties_optional_integer_active_tab_index, type: 'integer'}, {param: 'with_properties_optional_boolean_miniaturized', prop: 'miniaturized', value: with_properties_optional_boolean_miniaturized, type: 'boolean'}, {param: 'with_properties_optional_boolean_minimized', prop: 'minimized', value: with_properties_optional_boolean_minimized, type: 'boolean'}, {param: 'with_properties_optional_boolean_visible', prop: 'visible', value: with_properties_optional_boolean_visible, type: 'boolean'}, {param: 'with_properties_optional_text_mode', prop: 'mode', value: with_properties_optional_text_mode, type: 'text'}, {param: 'with_properties_optional_rectangle_bounds', prop: 'bounds', value: with_properties_optional_rectangle_bounds, type: 'rectangle'}])}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      at: at_optional_location_specifier || null,
+      with_data: with_data_optional_any || null,
+      index: with_properties_optional_integer_index || null,
+      given_name: with_properties_optional_text_given_name || null,
+      zoomed: with_properties_optional_boolean_zoomed || null,
+      active_tab_index: with_properties_optional_integer_active_tab_index || null,
+      miniaturized: with_properties_optional_boolean_miniaturized || null,
+      minimized: with_properties_optional_boolean_minimized || null,
+      visible: with_properties_optional_boolean_visible || null,
+      mode: with_properties_optional_text_mode || null,
+      bounds: with_properties_optional_rectangle_bounds || null
+    };
+  }
+
+  async makeBookmarkFolder(at_optional_location_specifier, with_data_optional_any, with_properties_optional_text_title) {
+
+    const castedAt = at_optional_location_specifier ? castAndEscape(at_optional_location_specifier) : null;
+    const valueForScriptAt = castedAt && typeof castedAt === 'string' && !castedAt.startsWith('{') && !castedAt.startsWith('date') ? `"${castedAt.replace(/"/g, "'")}"` : castedAt;
+    const castedWith_data = with_data_optional_any ? castAndEscape(with_data_optional_any) : null;
+    const valueForScriptWith_data = castedWith_data && typeof castedWith_data === 'string' && !castedWith_data.startsWith('{') && !castedWith_data.startsWith('date') ? `"${castedWith_data.replace(/"/g, "'")}"` : castedWith_data;
+    const castedWith_properties_optional_text_title = with_properties_optional_text_title ? castAndEscape(with_properties_optional_text_title) : null;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        make new bookmark folder ${at_optional_location_specifier ? ' at ' + valueForScriptAt : ''}${with_data_optional_any ? ' with data ' + valueForScriptWith_data : ''}${buildPropertiesRecord([{param: 'with_properties_optional_text_title', prop: 'title', value: with_properties_optional_text_title, type: 'text'}])}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      at: at_optional_location_specifier || null,
+      with_data: with_data_optional_any || null,
+      title: with_properties_optional_text_title || null
+    };
+  }
+
+  async move(direct_parameter_required_specifier, to_required_location_specifier) {
+    if (direct_parameter_required_specifier === undefined || direct_parameter_required_specifier === null) {
+      throw new Error("direct_parameter_required_specifier is required");
+    }
+
+    if (to_required_location_specifier === undefined || to_required_location_specifier === null) {
+      throw new Error("to_required_location_specifier is required");
+    }
+
+    const castedDirect_parameter = direct_parameter_required_specifier ? castAndEscape(direct_parameter_required_specifier) : null;
+    const castedTo = to_required_location_specifier ? castAndEscape(to_required_location_specifier) : null;
+
+    const script = `
+      tell application "Brave Browser"
+        move ${castedDirect_parameter} to ${castedTo}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      direct_parameter: direct_parameter_required_specifier || null,
+      to: to_required_location_specifier || null
+    };
+  }
+
+  async printForDocument(target_document_required_string) {
+    if (!target_document_required_string || typeof target_document_required_string !== "string") {
+      throw new Error("target_document_required_string is required and must be a string");
+    }
+
+    const castedDocument = castAndEscape(target_document_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        print ${castedDocument}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      document: target_document_required_string
+    };
+  }
+
+  async printForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        print (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async printForWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        print ${castedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getGivenNameOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return given name of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setGivenNameOfWindow(target_window_required_string, value_required_text) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_text === undefined || value_required_text === null) {
+      throw new Error("value_required_text is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_text, 'text');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set given name of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_text,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getMinimizableOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return minimizable of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getMinimizedOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return minimized of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setMinimizedOfWindow(target_window_required_string, value_required_boolean) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_boolean === undefined || value_required_boolean === null) {
+      throw new Error("value_required_boolean is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_boolean, 'boolean');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set minimized of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_boolean,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getActiveTabOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return active tab of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getModeOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return mode of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setModeOfWindow(target_window_required_string, value_required_text) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_text === undefined || value_required_text === null) {
+      throw new Error("value_required_text is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_text, 'text');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set mode of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_text,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async getActiveTabIndexOfWindow(target_window_required_string) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return active tab index of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async setActiveTabIndexOfWindow(target_window_required_string, value_required_integer) {
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_integer === undefined || value_required_integer === null) {
+      throw new Error("value_required_integer is required");
+    }
+
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_integer, 'integer');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set active tab index of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_integer,
+      script: script,
+      window: target_window_required_string
+    };
+  }
+
+  async reloadForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        reload (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async goBackForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        go back (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async goForwardForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        go forward (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async selectAllForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        select all (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async cutSelectionForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        cut selection (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async copySelectionForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        copy selection (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async pasteSelectionForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        paste selection (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async undoForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        undo (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async redoForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        redo (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async stopForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        stop (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async viewSourceForTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        view source (${castedTab} of ${castedWindow})
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async executeForTabOfWindow(target_tab_required_string, target_window_required_string, javascript_required_text) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (javascript_required_text === undefined || javascript_required_text === null) {
+      throw new Error("javascript_required_text is required");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string);
+    const castedWindow = castAndEscape(target_window_required_string);
+    const castedJavascript = javascript_required_text ? castAndEscape(javascript_required_text) : null;
+    const valueForScriptJavascript = castedJavascript && typeof castedJavascript === 'string' && !castedJavascript.startsWith('{') && !castedJavascript.startsWith('date') ? `"${castedJavascript.replace(/"/g, "'")}"` : castedJavascript;
+
+    // Helper function to build properties record from individual property parameters
+    function buildPropertiesRecord(propertyParams) {
+      const definedProps = propertyParams.filter(p => p.value !== undefined && p.value !== null && p.value !== '');
+      if (definedProps.length === 0) return '';
+      const propStrings = definedProps.map(p => {
+        const castedValue = castAndEscape(p.value, p.type || null);
+        // For strings that got escaped, wrap in quotes and replace inner quotes
+        if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+          return `${p.prop}:"${castedValue.replace(/"/g, "'")}"`;
+        }
+        // For numbers, booleans, lists, records, dates - no quotes
+        return `${p.prop}:${castedValue}`;
+      });
+      return ` with properties {${propStrings.join(', ')}}`;
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        execute (${castedTab} of ${castedWindow}) javascript ${valueForScriptJavascript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string,
+      javascript: javascript_required_text || null
+    };
+  }
+
+  async getBookmarksBarOfApplication() {
+    const script = `
+      tell application "Brave Browser"
+        return bookmarks bar
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script
+    };
+  }
+
+  async getOtherBookmarksOfApplication() {
+    const script = `
+      tell application "Brave Browser"
+        return other bookmarks
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script
+    };
+  }
+
+  async getIdOfTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedTab = escapeForAppleScript(target_tab_required_string);
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return id of ${escapedTab} of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async getTitleOfTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedTab = escapeForAppleScript(target_tab_required_string);
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return title of ${escapedTab} of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async getUrlOfTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedTab = escapeForAppleScript(target_tab_required_string);
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return URL of ${escapedTab} of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async setUrlOfTabOfWindow(target_tab_required_string, target_window_required_string, value_required_text) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+    if (value_required_text === undefined || value_required_text === null) {
+      throw new Error("value_required_text is required");
+    }
+
+    const castedTab = castAndEscape(target_tab_required_string, 'string');
+    const castedWindow = castAndEscape(target_window_required_string, 'string');
+    const castedValue = castAndEscape(value_required_text, 'text');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set URL of ${castedTab} of ${castedWindow} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_text,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async getLoadingOfTabOfWindow(target_tab_required_string, target_window_required_string) {
+    if (!target_tab_required_string || typeof target_tab_required_string !== "string") {
+      throw new Error("target_tab_required_string is required and must be a string");
+    }
+    if (!target_window_required_string || typeof target_window_required_string !== "string") {
+      throw new Error("target_window_required_string is required and must be a string");
+    }
+
+    const escapedTab = escapeForAppleScript(target_tab_required_string);
+    const escapedWindow = escapeForAppleScript(target_window_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return loading of ${escapedTab} of ${escapedWindow}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      tab: target_tab_required_string,
+      window: target_window_required_string
+    };
+  }
+
+  async getIdOfBookmarkFolder(target_bookmark_folder_required_string) {
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const escapedBookmarkFolder = escapeForAppleScript(target_bookmark_folder_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return id of ${escapedBookmarkFolder}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async getTitleOfBookmarkFolder(target_bookmark_folder_required_string) {
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const escapedBookmarkFolder = escapeForAppleScript(target_bookmark_folder_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return title of ${escapedBookmarkFolder}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async setTitleOfBookmarkFolder(target_bookmark_folder_required_string, value_required_text) {
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+    if (value_required_text === undefined || value_required_text === null) {
+      throw new Error("value_required_text is required");
+    }
+
+    const castedBookmarkFolder = castAndEscape(target_bookmark_folder_required_string, 'string');
+    const castedValue = castAndEscape(value_required_text, 'text');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set title of ${castedBookmarkFolder} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_text,
+      script: script,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async getIndexOfBookmarkFolder(target_bookmark_folder_required_string) {
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const escapedBookmarkFolder = escapeForAppleScript(target_bookmark_folder_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return index of ${escapedBookmarkFolder}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async getIdOfBookmarkItemOfBookmarkFolder(target_bookmark_item_required_string, target_bookmark_folder_required_string) {
+    if (!target_bookmark_item_required_string || typeof target_bookmark_item_required_string !== "string") {
+      throw new Error("target_bookmark_item_required_string is required and must be a string");
+    }
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const escapedBookmarkItem = escapeForAppleScript(target_bookmark_item_required_string);
+    const escapedBookmarkFolder = escapeForAppleScript(target_bookmark_folder_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return id of ${escapedBookmarkItem} of ${escapedBookmarkFolder}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      bookmark_item: target_bookmark_item_required_string,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async getTitleOfBookmarkItemOfBookmarkFolder(target_bookmark_item_required_string, target_bookmark_folder_required_string) {
+    if (!target_bookmark_item_required_string || typeof target_bookmark_item_required_string !== "string") {
+      throw new Error("target_bookmark_item_required_string is required and must be a string");
+    }
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const escapedBookmarkItem = escapeForAppleScript(target_bookmark_item_required_string);
+    const escapedBookmarkFolder = escapeForAppleScript(target_bookmark_folder_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return title of ${escapedBookmarkItem} of ${escapedBookmarkFolder}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      bookmark_item: target_bookmark_item_required_string,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async setTitleOfBookmarkItemOfBookmarkFolder(target_bookmark_item_required_string, target_bookmark_folder_required_string, value_required_text) {
+    if (!target_bookmark_item_required_string || typeof target_bookmark_item_required_string !== "string") {
+      throw new Error("target_bookmark_item_required_string is required and must be a string");
+    }
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+    if (value_required_text === undefined || value_required_text === null) {
+      throw new Error("value_required_text is required");
+    }
+
+    const castedBookmarkItem = castAndEscape(target_bookmark_item_required_string, 'string');
+    const castedBookmarkFolder = castAndEscape(target_bookmark_folder_required_string, 'string');
+    const castedValue = castAndEscape(value_required_text, 'text');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set title of ${castedBookmarkItem} of ${castedBookmarkFolder} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_text,
+      script: script,
+      bookmark_item: target_bookmark_item_required_string,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async getUrlOfBookmarkItemOfBookmarkFolder(target_bookmark_item_required_string, target_bookmark_folder_required_string) {
+    if (!target_bookmark_item_required_string || typeof target_bookmark_item_required_string !== "string") {
+      throw new Error("target_bookmark_item_required_string is required and must be a string");
+    }
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const escapedBookmarkItem = escapeForAppleScript(target_bookmark_item_required_string);
+    const escapedBookmarkFolder = escapeForAppleScript(target_bookmark_folder_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return URL of ${escapedBookmarkItem} of ${escapedBookmarkFolder}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      bookmark_item: target_bookmark_item_required_string,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async setUrlOfBookmarkItemOfBookmarkFolder(target_bookmark_item_required_string, target_bookmark_folder_required_string, value_required_text) {
+    if (!target_bookmark_item_required_string || typeof target_bookmark_item_required_string !== "string") {
+      throw new Error("target_bookmark_item_required_string is required and must be a string");
+    }
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+    if (value_required_text === undefined || value_required_text === null) {
+      throw new Error("value_required_text is required");
+    }
+
+    const castedBookmarkItem = castAndEscape(target_bookmark_item_required_string, 'string');
+    const castedBookmarkFolder = castAndEscape(target_bookmark_folder_required_string, 'string');
+    const castedValue = castAndEscape(value_required_text, 'text');
+    // Determine value format for AppleScript
+    let valueForScript;
+    if (typeof castedValue === 'string' && !castedValue.startsWith('{') && !castedValue.startsWith('date')) {
+      valueForScript = `"${castedValue}"`; // Wrap strings in quotes
+    } else {
+      valueForScript = castedValue; // Use as-is for numbers, booleans, lists, records
+    }
+
+    const script = `
+      tell application "Brave Browser"
+        set URL of ${castedBookmarkItem} of ${castedBookmarkFolder} to ${valueForScript}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      message: "Property set successfully",
+      value: value_required_text,
+      script: script,
+      bookmark_item: target_bookmark_item_required_string,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  async getIndexOfBookmarkItemOfBookmarkFolder(target_bookmark_item_required_string, target_bookmark_folder_required_string) {
+    if (!target_bookmark_item_required_string || typeof target_bookmark_item_required_string !== "string") {
+      throw new Error("target_bookmark_item_required_string is required and must be a string");
+    }
+    if (!target_bookmark_folder_required_string || typeof target_bookmark_folder_required_string !== "string") {
+      throw new Error("target_bookmark_folder_required_string is required and must be a string");
+    }
+
+    const escapedBookmarkItem = escapeForAppleScript(target_bookmark_item_required_string);
+    const escapedBookmarkFolder = escapeForAppleScript(target_bookmark_folder_required_string);
+
+    const script = `
+      tell application "Brave Browser"
+        return index of ${escapedBookmarkItem} of ${escapedBookmarkFolder}
+      end tell
+    `;
+
+    const result = await executeAppleScript(script);
+    return {
+      success: result !== "Error",
+      value: result,
+      script: script,
+      bookmark_item: target_bookmark_item_required_string,
+      bookmark_folder: target_bookmark_folder_required_string
+    };
+  }
+
+  sendResponse(response) {
+    const responseStr = JSON.stringify(response);
+    console.error("Sending response:", response.method || 'result', response.id);
+    process.stdout.write(responseStr + '\n');
+  }
+}
+
+// Start the server
+async function startServer() {
+  console.error("Testing Brave Browser availability...");
+  await checkBraveBrowserAvailable();
+  
+  console.error("Creating Brave Browser MCP server...");
+  const server = new BraveBrowserMCPServer();
+  
+  console.error("Brave Browser AppleScript MCP server running on stdio");
+  
+  // Keep the process alive
+  process.on('SIGINT', () => {
+    console.error("Shutting down Brave Browser AppleScript MCP server");
+    process.exit(0);
+  });
+  
+  process.on('SIGTERM', () => {
+    console.error("Shutting down Brave Browser AppleScript MCP server");
+    process.exit(0);
+  });
+}
+
+startServer().catch(error => {
+  console.error("Fatal error starting server:", error);
+  process.exit(1);
+});

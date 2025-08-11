@@ -1,0 +1,502 @@
+{
+  "description": "Control Brave Browser application through AppleScript with full class hierarchy support",
+  "dxt_version": "0.1",
+  "version": "0.1.0",
+  "long_description": "This enhanced extension allows you to control Brave Browser through its official AppleScript API with complete class hierarchy support. Property getters and setters now include the full object path for precise targeting. Includes static data functions for exploring the application's complete class structure and command mappings.",
+  "author": {
+    "name": "StarDAE",
+    "email": "support@stardae.com"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server/index.js"
+      ],
+      "env": {
+        "dummy": "temp"
+      }
+    }
+  },
+  "license": "MIT",
+  "icon": "icon.png",
+  "display_name": "Brave Browser (AppleScript)",
+  "scripts": {
+    "start": "node server/index.js",
+    "build": "npx @anthropic-ai/dxt pack"
+  },
+  "tools": [
+    {
+      "name": "open",
+      "description": "Open a document."
+    },
+    {
+      "name": "close_for_document",
+      "description": "Close a document."
+    },
+    {
+      "name": "close_for_tab_of_window",
+      "description": "Close a tab of window."
+    },
+    {
+      "name": "close_for_window",
+      "description": "Close a window."
+    },
+    {
+      "name": "save_for_document",
+      "description": "Save a document."
+    },
+    {
+      "name": "save_for_tab_of_window",
+      "description": "Save a tab of window."
+    },
+    {
+      "name": "save_for_window",
+      "description": "Save a window."
+    },
+    {
+      "name": "print_file",
+      "description": "Print a document. (file input)"
+    },
+    {
+      "name": "print_for_document",
+      "description": "Print a document."
+    },
+    {
+      "name": "print_for_tab_of_window",
+      "description": "Print a tab of window."
+    },
+    {
+      "name": "print_for_window",
+      "description": "Print a window."
+    },
+    {
+      "name": "quit",
+      "description": "Quit the application."
+    },
+    {
+      "name": "count_document",
+      "description": "Return the number of elements of a particular class within a document."
+    },
+    {
+      "name": "count_bookmark_item_of_bookmark_folder",
+      "description": "Return the number of elements of a particular class within a bookmark item of bookmark folder."
+    },
+    {
+      "name": "count_tab_of_window",
+      "description": "Return the number of elements of a particular class within a tab of window."
+    },
+    {
+      "name": "count_window",
+      "description": "Return the number of elements of a particular class within a window."
+    },
+    {
+      "name": "count_bookmark_folder",
+      "description": "Return the number of elements of a particular class within a bookmark folder."
+    },
+    {
+      "name": "delete",
+      "description": "Delete an object."
+    },
+    {
+      "name": "duplicate",
+      "description": "Copy an object."
+    },
+    {
+      "name": "exists",
+      "description": "Verify that an object exists."
+    },
+    {
+      "name": "make_document",
+      "description": "Create a new document."
+    },
+    {
+      "name": "make_bookmark_item_of_bookmark_folder",
+      "description": "Create a new bookmark item of bookmark folder."
+    },
+    {
+      "name": "make_tab_of_window",
+      "description": "Create a new tab of window."
+    },
+    {
+      "name": "make_window",
+      "description": "Create a new window."
+    },
+    {
+      "name": "make_bookmark_folder",
+      "description": "Create a new bookmark folder."
+    },
+    {
+      "name": "move",
+      "description": "Move an object to a new location."
+    },
+    {
+      "name": "get_name_of_application",
+      "description": "Get The name of the application."
+    },
+    {
+      "name": "get_frontmost_of_application",
+      "description": "Get Is this the active application?"
+    },
+    {
+      "name": "get_version_of_application",
+      "description": "Get The version number of the application."
+    },
+    {
+      "name": "get_name_of_document",
+      "description": "Get Its name. of document"
+    },
+    {
+      "name": "get_modified_of_document",
+      "description": "Get Has it been modified since the last save? of document"
+    },
+    {
+      "name": "get_file_of_document",
+      "description": "Get Its location on disk, if it has one. of document"
+    },
+    {
+      "name": "get_name_of_window",
+      "description": "Get The title of the window."
+    },
+    {
+      "name": "get_id_of_window",
+      "description": "Get The unique identifier of the window."
+    },
+    {
+      "name": "get_index_of_window",
+      "description": "Get The index of the window, ordered front to back."
+    },
+    {
+      "name": "set_index_of_window",
+      "description": "Set The index of the window, ordered front to back."
+    },
+    {
+      "name": "get_bounds_of_window",
+      "description": "Get The bounding rectangle of the window."
+    },
+    {
+      "name": "set_bounds_of_window",
+      "description": "Set The bounding rectangle of the window."
+    },
+    {
+      "name": "get_closeable_of_window",
+      "description": "Get Does the window have a close button?"
+    },
+    {
+      "name": "get_miniaturizable_of_window",
+      "description": "Get Does the window have a minimize button?"
+    },
+    {
+      "name": "get_miniaturized_of_window",
+      "description": "Get Is the window minimized right now?"
+    },
+    {
+      "name": "set_miniaturized_of_window",
+      "description": "Set Is the window minimized right now?"
+    },
+    {
+      "name": "get_resizable_of_window",
+      "description": "Get Can the window be resized?"
+    },
+    {
+      "name": "get_visible_of_window",
+      "description": "Get Is the window visible right now?"
+    },
+    {
+      "name": "set_visible_of_window",
+      "description": "Set Is the window visible right now?"
+    },
+    {
+      "name": "get_zoomable_of_window",
+      "description": "Get Does the window have a zoom button?"
+    },
+    {
+      "name": "get_zoomed_of_window",
+      "description": "Get Is the window zoomed right now?"
+    },
+    {
+      "name": "set_zoomed_of_window",
+      "description": "Set Is the window zoomed right now?"
+    },
+    {
+      "name": "get_document_of_window",
+      "description": "Get The document whose contents are displayed in the window."
+    },
+    {
+      "name": "save_for_document",
+      "description": "Save a document."
+    },
+    {
+      "name": "save_for_tab_of_window",
+      "description": "Save a tab of window."
+    },
+    {
+      "name": "save_for_window",
+      "description": "Save a window."
+    },
+    {
+      "name": "open",
+      "description": "Open a document."
+    },
+    {
+      "name": "close_for_document",
+      "description": "Close a document."
+    },
+    {
+      "name": "close_for_tab_of_window",
+      "description": "Close a tab of window."
+    },
+    {
+      "name": "close_for_window",
+      "description": "Close a window."
+    },
+    {
+      "name": "quit",
+      "description": "Quit the application."
+    },
+    {
+      "name": "count_document",
+      "description": "Return the number of elements of a particular class within a document."
+    },
+    {
+      "name": "count_bookmark_item_of_bookmark_folder",
+      "description": "Return the number of elements of a particular class within a bookmark item of bookmark folder."
+    },
+    {
+      "name": "count_tab_of_window",
+      "description": "Return the number of elements of a particular class within a tab of window."
+    },
+    {
+      "name": "count_window",
+      "description": "Return the number of elements of a particular class within a window."
+    },
+    {
+      "name": "count_bookmark_folder",
+      "description": "Return the number of elements of a particular class within a bookmark folder."
+    },
+    {
+      "name": "delete",
+      "description": "Delete an object."
+    },
+    {
+      "name": "duplicate",
+      "description": "Copy object(s) and put the copies at a new location."
+    },
+    {
+      "name": "exists",
+      "description": "Verify if an object exists."
+    },
+    {
+      "name": "make_document",
+      "description": "Make a new document."
+    },
+    {
+      "name": "make_bookmark_item_of_bookmark_folder",
+      "description": "Make a new bookmark item of bookmark folder."
+    },
+    {
+      "name": "make_tab_of_window",
+      "description": "Make a new tab of window."
+    },
+    {
+      "name": "make_window",
+      "description": "Make a new window."
+    },
+    {
+      "name": "make_bookmark_folder",
+      "description": "Make a new bookmark folder."
+    },
+    {
+      "name": "move",
+      "description": "Move object(s) to a new location."
+    },
+    {
+      "name": "print_for_document",
+      "description": "Print a document."
+    },
+    {
+      "name": "print_for_tab_of_window",
+      "description": "Print a tab of window."
+    },
+    {
+      "name": "print_for_window",
+      "description": "Print a window."
+    },
+    {
+      "name": "get_given_name_of_window",
+      "description": "Get The given name of the window."
+    },
+    {
+      "name": "set_given_name_of_window",
+      "description": "Set The given name of the window."
+    },
+    {
+      "name": "get_minimizable_of_window",
+      "description": "Get Whether the window can be minimized."
+    },
+    {
+      "name": "get_minimized_of_window",
+      "description": "Get Whether the window is currently minimized."
+    },
+    {
+      "name": "set_minimized_of_window",
+      "description": "Set Whether the window is currently minimized."
+    },
+    {
+      "name": "get_active_tab_of_window",
+      "description": "Get Returns the currently selected tab of window"
+    },
+    {
+      "name": "get_mode_of_window",
+      "description": "Get Represents the mode of the window which can be 'normal' or 'incognito', can be set only once during creation of the window."
+    },
+    {
+      "name": "set_mode_of_window",
+      "description": "Set Represents the mode of the window which can be 'normal' or 'incognito', can be set only once during creation of the window."
+    },
+    {
+      "name": "get_active_tab_index_of_window",
+      "description": "Get The index of the active tab. of window"
+    },
+    {
+      "name": "set_active_tab_index_of_window",
+      "description": "Set The index of the active tab. of window"
+    },
+    {
+      "name": "reload_for_tab_of_window",
+      "description": "Reload a tab."
+    },
+    {
+      "name": "go_back_for_tab_of_window",
+      "description": "Go Back (If Possible) for tab of window."
+    },
+    {
+      "name": "go_forward_for_tab_of_window",
+      "description": "Go Forward (If Possible) for tab of window."
+    },
+    {
+      "name": "select_all_for_tab_of_window",
+      "description": "Select all for tab of window."
+    },
+    {
+      "name": "cut_selection_for_tab_of_window",
+      "description": "Cut selected text (If Possible) for tab of window."
+    },
+    {
+      "name": "copy_selection_for_tab_of_window",
+      "description": "Copy text for tab of window."
+    },
+    {
+      "name": "paste_selection_for_tab_of_window",
+      "description": "Paste text (If Possible) for tab of window."
+    },
+    {
+      "name": "undo_for_tab_of_window",
+      "description": "Undo the last change for tab of window."
+    },
+    {
+      "name": "redo_for_tab_of_window",
+      "description": "Redo the last change for tab of window."
+    },
+    {
+      "name": "stop_for_tab_of_window",
+      "description": "Stop the current tab from loading."
+    },
+    {
+      "name": "view_source_for_tab_of_window",
+      "description": "View the HTML source of the tab."
+    },
+    {
+      "name": "execute_for_tab_of_window",
+      "description": "Execute a piece of javascript for tab of window."
+    },
+    {
+      "name": "get_bookmarks_bar_of_application",
+      "description": "Get The bookmarks bar bookmark folder. of application"
+    },
+    {
+      "name": "get_other_bookmarks_of_application",
+      "description": "Get The other bookmarks bookmark folder. of application"
+    },
+    {
+      "name": "get_id_of_tab_of_window",
+      "description": "Get Unique ID of the tab."
+    },
+    {
+      "name": "get_title_of_tab_of_window",
+      "description": "Get The title of the tab."
+    },
+    {
+      "name": "get_url_of_tab_of_window",
+      "description": "Get The url visible to the user. of tab"
+    },
+    {
+      "name": "set_url_of_tab_of_window",
+      "description": "Set The url visible to the user. of tab"
+    },
+    {
+      "name": "get_loading_of_tab_of_window",
+      "description": "Get Is loading? of tab"
+    },
+    {
+      "name": "get_id_of_bookmark_folder",
+      "description": "Get Unique ID of the bookmark folder."
+    },
+    {
+      "name": "get_title_of_bookmark_folder",
+      "description": "Get The title of the folder. of bookmark folder"
+    },
+    {
+      "name": "set_title_of_bookmark_folder",
+      "description": "Set The title of the folder. of bookmark folder"
+    },
+    {
+      "name": "get_index_of_bookmark_folder",
+      "description": "Get Returns the index with respect to its parent bookmark folder."
+    },
+    {
+      "name": "get_id_of_bookmark_item_of_bookmark_folder",
+      "description": "Get Unique ID of the bookmark item."
+    },
+    {
+      "name": "get_title_of_bookmark_item_of_bookmark_folder",
+      "description": "Get The title of the bookmark item."
+    },
+    {
+      "name": "set_title_of_bookmark_item_of_bookmark_folder",
+      "description": "Set The title of the bookmark item."
+    },
+    {
+      "name": "get_url_of_bookmark_item_of_bookmark_folder",
+      "description": "Get The URL of the bookmark. of bookmark item"
+    },
+    {
+      "name": "set_url_of_bookmark_item_of_bookmark_folder",
+      "description": "Set The URL of the bookmark. of bookmark item"
+    },
+    {
+      "name": "get_index_of_bookmark_item_of_bookmark_folder",
+      "description": "Get Returns the index with respect to its parent bookmark folder. of bookmark item"
+    }
+  ],
+  "keywords": [
+    "brave-browser",
+    "applescript",
+    "automation",
+    "hierarchy",
+    "static-data",
+    "class-structure"
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ]
+  },
+  "name": "brave-browser-applescript",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stardae/brave-browser-applescript"
+  }
+}
